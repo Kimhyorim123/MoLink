@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-molink/
 env/
 venv/
 ENV/
@@ -214,3 +215,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local experiment outputs
+results/
