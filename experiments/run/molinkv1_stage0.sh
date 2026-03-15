@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # MoLink(v1) distributed pipeline stage0 (HTTP ingress)
-# Run this on node4 (192.168.79.9)
+# Run this on node5 (192.168.79.4) as the head stage
 
 VENV_PY=${VENV_PY:-"/home/sslab/MoLink/.venv-molink/bin/python"}
 MODEL=${MODEL:-"Qwen/Qwen2.5-7B-Instruct"}

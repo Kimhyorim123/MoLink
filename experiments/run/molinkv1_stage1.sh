@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # MoLink(v1) distributed pipeline stage1
-# Run this on node5 (192.168.79.4)
+# Run this on node2 (192.168.79.20)
 
 VENV_PY=${VENV_PY:-"/home/sslab/MoLink/.venv-molink/bin/python"}
 MODEL=${MODEL:-"Qwen/Qwen2.5-7B-Instruct"}
@@ -16,8 +16,8 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 # gRPC port for this stage
 GRPC_PORT=${GRPC_PORT:-50062}
 
-# stage0 gRPC peer (node4)
-INITIAL_PEER=${INITIAL_PEER:-"192.168.79.9:50061"}
+# stage0 gRPC peer (node5 head)
+INITIAL_PEER=${INITIAL_PEER:-"192.168.79.4:50061"}
 
 START_LAYER=${START_LAYER:-11}
 END_LAYER=${END_LAYER:-22}
