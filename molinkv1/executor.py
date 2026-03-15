@@ -46,6 +46,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _classify_scheduler_phase(scheduler_output: "SchedulerOutput") -> str:
+    num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {})
+    if not num_scheduled_tokens:
+        return "empty"
+
+    has_prefill = bool(getattr(scheduler_output, "scheduled_new_reqs", []))
+    has_decode = False
+
+    for num_tokens in num_scheduled_tokens.values():
+        if num_tokens > 1:
+            has_prefill = True
+        elif num_tokens == 1:
+            has_decode = True
+
+    if has_prefill and has_decode:
+        return "mixed"
+    if has_prefill:
+        return "prefill"
+    return "decode"
+
+
 class MolinkExecutor(MultiprocExecutor):
     """Executor for cross-node pipeline parallelism using gRPC.
 
@@ -361,9 +382,20 @@ class MolinkExecutor(MultiprocExecutor):
 
             # Get pipeline metadata
             grpc_metadata = self.molink_service.topology.get_metadata()
+            grpc_metadata = dict(grpc_metadata)
+            transmission_phase = _classify_scheduler_phase(scheduler_output)
+            grpc_metadata["transmission_phase"] = transmission_phase
             server_list = grpc_metadata.get("server_list", [])
 
             virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
+            logger.info(
+                "[MoLink][VE%s] scheduler_phase=%s total_tokens=%s new_reqs=%s cached_reqs=%s",
+                virtual_engine,
+                transmission_phase,
+                scheduler_output.total_num_scheduled_tokens,
+                len(getattr(scheduler_output, "scheduled_new_reqs", [])),
+                len(getattr(getattr(scheduler_output, "scheduled_cached_reqs", None), "req_ids", [])),
+            )
 
             # Serialize scheduler output using cloudpickle
             scheduler_output_bytes = cloudpickle.dumps(
@@ -534,6 +566,13 @@ class MolinkExecutor(MultiprocExecutor):
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][HEAD] Delivering {len(intermediate_tensors)} tensors to {next_server}"
             # )
+            logger.info(
+                "[MoLink][VE%s][HEAD] forwarding phase=%s to=%s tensors=%d",
+                virtual_engine,
+                grpc_metadata.get("transmission_phase", "unknown"),
+                next_server,
+                len(intermediate_tensors),
+            )
             self.delivery_manager.deliver_to_next(
                 intermediate_tensors,
                 scheduler_output_bytes,
@@ -751,6 +790,13 @@ class MolinkExecutor(MultiprocExecutor):
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Delivering {len(intermediate)} tensors to {next_server}"
                 # )
+                logger.info(
+                    "[MoLink][VE%s][WORKER_STEP] forwarding phase=%s to=%s tensors=%d",
+                    virtual_engine,
+                    grpc_metadata.get("transmission_phase", "unknown"),
+                    next_server,
+                    len(intermediate),
+                )
                 self.delivery_manager.deliver_to_next(
                     intermediate,
                     scheduler_output_bytes,

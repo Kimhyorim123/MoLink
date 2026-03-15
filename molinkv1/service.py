@@ -152,9 +152,18 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
 
             # Parse grpc metadata
             grpc_metadata = deserialize_metadata(request.grpc_metadata)
+            phase = grpc_metadata.get("transmission_phase", "unknown")
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][SERVICE] Parsed grpc metadata: {list(grpc_metadata.keys())}"
             # )
+
+            logger.info(
+                "[MoLink][VE%s][SERVICE] received phase=%s scheduler_bytes=%d tensors=%d",
+                virtual_engine,
+                phase,
+                len(scheduler_output_bytes),
+                len(intermediate_tensors_bytes),
+            )
 
             # Put into input queue for processing
             await self.input_queue[virtual_engine].put(
@@ -246,6 +255,14 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
                     await asyncio.wait_for(
                         self.input_queue[virtual_engine].get(), timeout=10.0
                     )
+                )
+                phase = grpc_metadata.get("transmission_phase", "unknown")
+                logger.info(
+                    "[MoLink][VE%s][WORKER] dequeued phase=%s scheduler_bytes=%d tensors=%d",
+                    virtual_engine,
+                    phase,
+                    len(scheduler_output_bytes),
+                    len(intermediate_tensors_bytes),
                 )
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][WORKER] Got data from input queue: scheduler={len(scheduler_output_bytes)} bytes, tensors={len(intermediate_tensors_bytes)} items"
