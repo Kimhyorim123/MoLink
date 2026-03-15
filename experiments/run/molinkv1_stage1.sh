@@ -5,6 +5,7 @@ set -euo pipefail
 # Run this on node2 (192.168.79.20)
 
 VENV_PY=${VENV_PY:-"/home/sslab/MoLink/.venv-molink/bin/python"}
+ROOT_DIR=${ROOT_DIR:-"/home/sslab/MoLink-deploy"}
 MODEL=${MODEL:-"Qwen/Qwen2.5-7B-Instruct"}
 HOST=${HOST:-"0.0.0.0"}
 PORT=${PORT:-8001}
@@ -30,10 +31,12 @@ export HF_MODULES_CACHE=${HF_MODULES_CACHE:-"${HF_HOME}/modules"}
 export PYTHONPATH="${HF_MODULES_CACHE}:${PYTHONPATH:-}"
 
 # Avoid permission issues with default ~/.cache/vllm paths on some nodes.
-export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-"${HF_HOME}/vllm_cache"}
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-"${ROOT_DIR}/.runtime/vllm_cache"}
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-"${HF_HOME}"}
+export TMPDIR=${TMPDIR:-"${ROOT_DIR}/.runtime/tmp"}
 
-mkdir -p "/home/sslab/MoLink/results" "$VLLM_CACHE_ROOT"
+RESULTS_DIR=${RESULTS_DIR:-"${ROOT_DIR}/results"}
+mkdir -p "$RESULTS_DIR" "$VLLM_CACHE_ROOT" "$TMPDIR"
 
 CHUNKED_FLAG="--no-enable-chunked-prefill"
 if [[ "$CHUNKED_PREFILL" == "1" ]]; then
@@ -51,4 +54,4 @@ exec "$VENV_PY" -m molinkv1.entrypoints.api_server \
   --molink-end-layer "$END_LAYER" \
   --molink-initial-peer "$INITIAL_PEER" \
   $CHUNKED_FLAG \
-  2>&1 | tee -a "/home/sslab/MoLink/results/_server_molink_stage1_${PORT}.log"
+  2>&1 | tee -a "$RESULTS_DIR/_server_molink_stage1_${PORT}.log"
