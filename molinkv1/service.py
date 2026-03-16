@@ -22,6 +22,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Chunked prefill can keep the next stage waiting for a full activation payload
+# noticeably longer than the original full-send path, especially across multiple hops.
+WORKER_INPUT_TIMEOUT_S = 60.0
+
+
 @dataclass
 class PartialTransferState:
     virtual_engine: int
@@ -297,7 +302,8 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             try:
                 scheduler_output_bytes, intermediate_tensors_bytes, grpc_metadata = (
                     await asyncio.wait_for(
-                        self.input_queue[virtual_engine].get(), timeout=10.0
+                        self.input_queue[virtual_engine].get(),
+                        timeout=WORKER_INPUT_TIMEOUT_S
                     )
                 )
                 phase = grpc_metadata.get("transmission_phase", "unknown")
