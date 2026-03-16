@@ -11,11 +11,13 @@ import io
 import multiprocessing as mp
 import time
 import traceback
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from queue import Empty
 from typing import Any, Deque, Dict, Optional, Set, Tuple
 
+import cloudpickle
 import grpc.aio as aio
 import torch
 from vllm.logger import init_logger
@@ -41,6 +43,12 @@ class DeliveryItem:
     scheduler_output_bytes: Optional[bytes] = None
     grpc_metadata: Optional[Dict[str, Any]] = None
     output_bytes: Optional[bytes] = None
+    transfer_id: Optional[str] = None
+    serialized_payload: Optional[bytes] = None
+    total_bytes: int = 0
+    offset: int = 0
+    left_bytes: int = 0
+    is_chunked: bool = False
 
 
 class TensorDeliveryProcess(mp.Process):
@@ -57,6 +65,7 @@ class TensorDeliveryProcess(mp.Process):
         max_message_size_mb: int = 200,
         max_waiting_weight: int = 30,
         max_inflight_sends: int = 2,
+        chunk_size_bytes: int = 512 * 1024,
     ):
         """Initialize the delivery process.
 
@@ -65,12 +74,14 @@ class TensorDeliveryProcess(mp.Process):
             max_waiting_weight: Number of decode-priority selections to allow
                 before forcing one prefill transmission.
             max_inflight_sends: Maximum number of concurrent send tasks.
+            chunk_size_bytes: Fixed chunk size for prefill chunk transmission.
         """
         super().__init__(daemon=True, name="MolinkTensorDelivery")
 
         self.max_message_size_mb = max_message_size_mb
         self.max_waiting_weight = max_waiting_weight
         self.max_inflight_sends = max_inflight_sends
+        self.chunk_size_bytes = chunk_size_bytes
 
         # Queue for pending deliveries from the main process.
         self.delivery_queue: mp.Queue = mp.Queue(maxsize=100)
@@ -167,6 +178,109 @@ class TensorDeliveryProcess(mp.Process):
                 logger.error(f"[MoLink][DELIVERY] Error delivering sampler output: {e}")
                 traceback.print_exc()
 
+        def _build_chunked_prefill_payload(item: DeliveryItem) -> None:
+            assert item.intermediate_tensors_cpu is not None
+            assert item.scheduler_output_bytes is not None
+            assert item.grpc_metadata is not None
+
+            tensor_bytes = {}
+            for key, tensor in item.intermediate_tensors_cpu.items():
+                buffer = io.BytesIO()
+                torch.save(tensor, buffer)
+                tensor_bytes[key] = buffer.getvalue()
+
+            envelope = {
+                "scheduler_output": item.scheduler_output_bytes,
+                "intermediate_tensors": tensor_bytes,
+                "grpc_metadata": item.grpc_metadata,
+                "virtual_engine": item.virtual_engine,
+            }
+            payload = cloudpickle.dumps(envelope)
+            item.transfer_id = uuid.uuid4().hex
+            item.serialized_payload = payload
+            item.total_bytes = len(payload)
+            item.offset = 0
+            item.left_bytes = len(payload)
+            item.is_chunked = True
+            logger.info(
+                "[MoLink][VE%s][DELIVERY] chunk_prepare phase=%s transfer_id=%s total_bytes=%d chunk_size=%d target=%s",
+                item.virtual_engine,
+                item.phase,
+                item.transfer_id,
+                item.total_bytes,
+                self.chunk_size_bytes,
+                item.target_server,
+            )
+
+        def _take_next_chunk(item: DeliveryItem) -> tuple[bytes, int, bool]:
+            assert item.serialized_payload is not None
+            start = item.offset
+            end = min(start + self.chunk_size_bytes, item.total_bytes)
+            chunk = item.serialized_payload[start:end]
+            item.offset = end
+            item.left_bytes = item.total_bytes - item.offset
+            is_last_chunk = item.left_bytes == 0
+            return chunk, start, is_last_chunk
+
+        async def deliver_prefill_chunk(item: DeliveryItem):
+            try:
+                assert item.grpc_metadata is not None
+                if item.serialized_payload is None:
+                    _build_chunked_prefill_payload(item)
+
+                chunk_data, chunk_offset, is_last_chunk = _take_next_chunk(item)
+                send_start_ts = _now_monotonic()
+                request = molink_pb2.GrpcRequestData(
+                    grpc_metadata=serialize_metadata(item.grpc_metadata),
+                    virtual_engine=item.virtual_engine,
+                    transfer_id=item.transfer_id or "",
+                    chunk_data=chunk_data,
+                    chunk_offset=chunk_offset,
+                    total_bytes=item.total_bytes,
+                    is_chunked=True,
+                    is_last_chunk=is_last_chunk,
+                )
+                stub = get_stub(item.target_server)
+                response = await stub.PushIntermediateTensors(request)
+                send_end_ts = _now_monotonic()
+                logger.info(
+                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f send_ms=%.3f response=%s",
+                    item.virtual_engine,
+                    item.phase,
+                    item.transfer_id,
+                    item.target_server,
+                    chunk_offset,
+                    len(chunk_data),
+                    item.left_bytes,
+                    (send_start_ts - item.enqueue_ts) * 1000.0,
+                    (send_end_ts - send_start_ts) * 1000.0,
+                    response.res,
+                )
+                if item.left_bytes > 0:
+                    item.enqueue_ts = _now_monotonic()
+                    prefill_queue.append(item)
+                    logger.info(
+                        "[MoLink][VE%s][DELIVERY] chunk_requeue phase=%s transfer_id=%s left=%d prefill_q=%d",
+                        item.virtual_engine,
+                        item.phase,
+                        item.transfer_id,
+                        item.left_bytes,
+                        len(prefill_queue),
+                    )
+                else:
+                    logger.info(
+                        "[MoLink][VE%s][DELIVERY] chunk_done phase=%s transfer_id=%s total_bytes=%d",
+                        item.virtual_engine,
+                        item.phase,
+                        item.transfer_id,
+                        item.total_bytes,
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[MoLink][DELIVERY] Error delivering prefill chunk: {e}"
+                )
+                traceback.print_exc()
+
         def ingest_item(item: DeliveryItem) -> None:
             if item.push_type == "head":
                 head_queue.append(item)
@@ -259,6 +373,8 @@ class TensorDeliveryProcess(mp.Process):
         def launch_item(item: DeliveryItem, reason: str) -> None:
             if item.push_type == "head":
                 coro = deliver_sampler_output(item)
+            elif item.phase == "prefill":
+                coro = deliver_prefill_chunk(item)
             else:
                 coro = deliver_intermediate_tensors(item)
 
@@ -374,6 +490,7 @@ class TensorDeliveryManager:
         max_message_size_mb: int = 200,
         max_waiting_weight: int = 30,
         max_inflight_sends: int = 2,
+        chunk_size_bytes: int = 512 * 1024,
     ):
         """Initialize the delivery manager.
 
@@ -382,10 +499,12 @@ class TensorDeliveryManager:
             max_waiting_weight: Number of decode-priority selections to allow
                 before forcing one prefill transmission.
             max_inflight_sends: Maximum number of concurrent send tasks.
+            chunk_size_bytes: Fixed chunk size for prefill chunk transmission.
         """
         self.max_message_size_mb = max_message_size_mb
         self.max_waiting_weight = max_waiting_weight
         self.max_inflight_sends = max_inflight_sends
+        self.chunk_size_bytes = chunk_size_bytes
         self._process: Optional[TensorDeliveryProcess] = None
 
     def start(self):
@@ -395,6 +514,7 @@ class TensorDeliveryManager:
                 self.max_message_size_mb,
                 max_waiting_weight=self.max_waiting_weight,
                 max_inflight_sends=self.max_inflight_sends,
+                chunk_size_bytes=self.chunk_size_bytes,
             )
             self._process.start()
             logger.info("Tensor delivery process started")

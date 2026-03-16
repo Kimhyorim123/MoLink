@@ -5,10 +5,14 @@ MoLink gRPC service implementation for cross-node pipeline parallelism.
 import asyncio
 import io
 import traceback
-from typing import TYPE_CHECKING, Dict
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict
+
+import cloudpickle
 import torch
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
+
 from molinkv1.comm import molink_pb2, molink_pb2_grpc
 from molinkv1.utils import PipelineTopology, deserialize_metadata
 
@@ -16,6 +20,15 @@ if TYPE_CHECKING:
     from .executor import MolinkExecutor
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class PartialTransferState:
+    virtual_engine: int
+    total_bytes: int
+    received_bytes: int
+    grpc_metadata: Dict[str, Any]
+    buffer: bytearray
 
 
 class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
@@ -57,6 +70,10 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
         # Lock for pipeline execution
         self.pp_lock = asyncio.Lock()
 
+        # Chunked prefill reassembly state
+        self.partial_transfers: Dict[str, PartialTransferState] = {}
+        self.partial_transfer_lock = asyncio.Lock()
+
         # Pipeline topology
         self.topology = PipelineTopology(head_ip, start_layer, end_layer)
 
@@ -65,15 +82,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
     async def JoinPipeline(
         self, request: molink_pb2.NodeInfo, context
     ) -> molink_pb2.GrpcResponseData:
-        """Handle a new node joining the pipeline.
-
-        Args:
-            request: NodeInfo containing the joining node's information.
-            context: gRPC context.
-
-        Returns:
-            GrpcResponseData indicating success or failure.
-        """
+        """Handle a new node joining the pipeline."""
         try:
             node_ip = request.ip
             start_layer = request.start_layer
@@ -95,15 +104,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
     async def GetTopology(
         self, request: molink_pb2.HealthCheckRequest, context
     ) -> molink_pb2.PipelineTopology:
-        """Get the current pipeline topology.
-
-        Args:
-            request: Health check request (empty).
-            context: gRPC context.
-
-        Returns:
-            PipelineTopology containing all nodes in the pipeline.
-        """
+        """Get the current pipeline topology."""
         nodes = []
         for node in self.topology.node_pool:
             nodes.append(
@@ -116,68 +117,156 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
 
         return molink_pb2.PipelineTopology(nodes=nodes)
 
+    def _store_chunk(
+        self,
+        request: molink_pb2.GrpcRequestData,
+        grpc_metadata: Dict[str, Any],
+    ) -> PartialTransferState:
+        if not request.transfer_id:
+            raise ValueError("Missing transfer_id for chunked transfer")
+        if request.total_bytes <= 0:
+            raise ValueError("total_bytes must be > 0 for chunked transfer")
+        if not request.chunk_data:
+            raise ValueError("chunk_data is empty for chunked transfer")
+
+        start = int(request.chunk_offset)
+        chunk_len = len(request.chunk_data)
+        end = start + chunk_len
+        total_bytes = int(request.total_bytes)
+
+        if start < 0 or end > total_bytes:
+            raise ValueError(
+                f"Chunk offset out of range: offset={start} end={end} total={total_bytes}"
+            )
+
+        state = self.partial_transfers.get(request.transfer_id)
+        if state is None:
+            state = PartialTransferState(
+                virtual_engine=request.virtual_engine,
+                total_bytes=total_bytes,
+                received_bytes=0,
+                grpc_metadata=grpc_metadata,
+                buffer=bytearray(total_bytes),
+            )
+            self.partial_transfers[request.transfer_id] = state
+        elif state.total_bytes != total_bytes:
+            raise ValueError(
+                f"Mismatched total_bytes for transfer {request.transfer_id}: "
+                f"{state.total_bytes} != {total_bytes}"
+            )
+
+        state.buffer[start:end] = request.chunk_data
+        state.received_bytes += chunk_len
+        return state
+
+    def _is_chunk_complete(self, state: PartialTransferState) -> bool:
+        return state.received_bytes == state.total_bytes
+
+    def _decode_chunked_payload(
+        self,
+        payload: bytes,
+    ) -> tuple[bytes, Dict[str, bytes], Dict[str, Any], int]:
+        envelope = cloudpickle.loads(payload)
+        scheduler_output_bytes = envelope["scheduler_output"]
+        intermediate_tensors_bytes = envelope["intermediate_tensors"]
+        grpc_metadata = envelope["grpc_metadata"]
+        virtual_engine = envelope["virtual_engine"]
+        return (
+            scheduler_output_bytes,
+            intermediate_tensors_bytes,
+            grpc_metadata,
+            virtual_engine,
+        )
+
+    async def _handle_full_intermediate_tensors(
+        self,
+        request: molink_pb2.GrpcRequestData,
+    ) -> molink_pb2.GrpcResponseData:
+        virtual_engine = request.virtual_engine
+        scheduler_output_bytes = request.scheduler_output
+
+        intermediate_tensors_bytes = {}
+        for entry in request.intermediate_tensors.tensors:
+            intermediate_tensors_bytes[entry.key] = entry.tensor_data
+
+        grpc_metadata = deserialize_metadata(request.grpc_metadata)
+        phase = grpc_metadata.get("transmission_phase", "unknown")
+
+        logger.info(
+            "[MoLink][VE%s][SERVICE] received phase=%s scheduler_bytes=%d tensors=%d",
+            virtual_engine,
+            phase,
+            len(scheduler_output_bytes),
+            len(intermediate_tensors_bytes),
+        )
+
+        await self.input_queue[virtual_engine].put(
+            (
+                scheduler_output_bytes,
+                intermediate_tensors_bytes,
+                grpc_metadata,
+            )
+        )
+        return molink_pb2.GrpcResponseData(res=1)
+
+    async def _handle_chunked_intermediate_tensors(
+        self,
+        request: molink_pb2.GrpcRequestData,
+    ) -> molink_pb2.GrpcResponseData:
+        grpc_metadata = deserialize_metadata(request.grpc_metadata)
+        phase = grpc_metadata.get("transmission_phase", "unknown")
+
+        async with self.partial_transfer_lock:
+            state = self._store_chunk(request, grpc_metadata)
+            logger.info(
+                "[MoLink][VE%s][SERVICE] chunk_recv phase=%s transfer_id=%s offset=%d chunk_bytes=%d received=%d total=%d",
+                request.virtual_engine,
+                phase,
+                request.transfer_id,
+                request.chunk_offset,
+                len(request.chunk_data),
+                state.received_bytes,
+                state.total_bytes,
+            )
+
+            if not self._is_chunk_complete(state):
+                return molink_pb2.GrpcResponseData(res=1)
+
+            full_payload = bytes(state.buffer)
+            del self.partial_transfers[request.transfer_id]
+
+        (
+            scheduler_output_bytes,
+            intermediate_tensors_bytes,
+            grpc_metadata,
+            virtual_engine,
+        ) = self._decode_chunked_payload(full_payload)
+
+        logger.info(
+            "[MoLink][VE%s][SERVICE] chunk_complete phase=%s transfer_id=%s total_bytes=%d",
+            virtual_engine,
+            grpc_metadata.get("transmission_phase", "unknown"),
+            request.transfer_id,
+            len(full_payload),
+        )
+
+        await self.input_queue[virtual_engine].put(
+            (
+                scheduler_output_bytes,
+                intermediate_tensors_bytes,
+                grpc_metadata,
+            )
+        )
+        return molink_pb2.GrpcResponseData(res=1)
+
     async def PushIntermediateTensors(
         self, request: molink_pb2.GrpcRequestData, context
     ) -> molink_pb2.GrpcResponseData:
-        """Receive intermediate tensors from the previous pipeline stage.
-
-        Args:
-            request: GrpcRequestData containing scheduler output and tensors.
-            context: gRPC context.
-
-        Returns:
-            GrpcResponseData indicating success or failure.
-        """
+        """Receive intermediate tensors from the previous pipeline stage."""
         try:
-            virtual_engine = request.virtual_engine
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] PushIntermediateTensors called"
-            # )
-
-            # Store raw bytes for deferred deserialization
-            scheduler_output_bytes = request.scheduler_output
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] Received scheduler output: {len(scheduler_output_bytes)} bytes"
-            # )
-
-            # Store tensor bytes (deserialization will be done in worker)
-            intermediate_tensors_bytes = {}
-            for entry in request.intermediate_tensors.tensors:
-                key = entry.key
-                byte_data = entry.tensor_data
-                intermediate_tensors_bytes[key] = byte_data
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] Received {len(intermediate_tensors_bytes)} tensors"
-            # )
-
-            # Parse grpc metadata
-            grpc_metadata = deserialize_metadata(request.grpc_metadata)
-            phase = grpc_metadata.get("transmission_phase", "unknown")
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] Parsed grpc metadata: {list(grpc_metadata.keys())}"
-            # )
-
-            logger.info(
-                "[MoLink][VE%s][SERVICE] received phase=%s scheduler_bytes=%d tensors=%d",
-                virtual_engine,
-                phase,
-                len(scheduler_output_bytes),
-                len(intermediate_tensors_bytes),
-            )
-
-            # Put into input queue for processing
-            await self.input_queue[virtual_engine].put(
-                (
-                    scheduler_output_bytes,
-                    intermediate_tensors_bytes,
-                    grpc_metadata,
-                )
-            )
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] Data placed in input queue (size: {self.input_queue[virtual_engine].qsize()})"
-            # )
-
-            return molink_pb2.GrpcResponseData(res=1)
+            if request.is_chunked:
+                return await self._handle_chunked_intermediate_tensors(request)
+            return await self._handle_full_intermediate_tensors(request)
 
         except Exception as e:
             logger.error(f"[MoLink][SERVICE] Error in PushIntermediateTensors: {e}")
@@ -187,36 +276,11 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
     async def PushSamplerOutput(
         self, request: molink_pb2.SamplerOutput, context
     ) -> molink_pb2.GrpcResponseData:
-        """Receive sampler output from the last pipeline stage.
-
-        This is called on the head node when the last stage completes
-        processing and has the final output.
-
-        Args:
-            request: SamplerOutput containing the model output.
-            context: gRPC context.
-
-        Returns:
-            GrpcResponseData indicating success or failure.
-        """
+        """Receive sampler output from the last pipeline stage."""
         try:
             virtual_engine = request.virtual_engine
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] PushSamplerOutput called"
-            # )
-
-            # Store raw bytes - will be deserialized by the executor
             output_bytes = request.output_data
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] Received sampler output: {len(output_bytes)} bytes"
-            # )
-
-            # Put into output queue for the head node to collect
             await self.output_queue[virtual_engine].put(output_bytes)
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][SERVICE] Output placed in queue (size: {self.output_queue[virtual_engine].qsize()})"
-            # )
-
             return molink_pb2.GrpcResponseData(res=1)
 
         except Exception as e:
@@ -227,29 +291,9 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
     async def ExecuteWorkerStep(
         self, request: molink_pb2.GrpcTriggerRequest, context
     ) -> molink_pb2.GrpcResponseData:
-        """Execute a forward step on this worker node.
-
-        This is called by the head node to trigger execution on worker nodes.
-        The worker should already have received intermediate tensors via
-        PushIntermediateTensors before this is called.
-
-        Args:
-            request: GrpcTriggerRequest containing the virtual engine ID.
-            context: gRPC context.
-
-        Returns:
-            GrpcResponseData indicating success or failure.
-        """
+        """Execute a forward step on this worker node."""
         try:
             virtual_engine = request.virtual_engine
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][WORKER] ExecuteWorkerStep called"
-            # )
-
-            # Get data from input queue (with timeout to detect issues)
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][WORKER] Waiting for data from input queue..."
-            # )
             try:
                 scheduler_output_bytes, intermediate_tensors_bytes, grpc_metadata = (
                     await asyncio.wait_for(
@@ -264,19 +308,11 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
                     len(scheduler_output_bytes),
                     len(intermediate_tensors_bytes),
                 )
-                # logger.info(
-                #     f"[MoLink][VE{virtual_engine}][WORKER] Got data from input queue: scheduler={len(scheduler_output_bytes)} bytes, tensors={len(intermediate_tensors_bytes)} items"
-                # )
             except asyncio.TimeoutError:
                 logger.error(
                     f"[MoLink][VE{virtual_engine}][WORKER] TIMEOUT waiting for input queue! Queue size: {self.input_queue[virtual_engine].qsize()}"
                 )
                 raise
-
-            # Deserialize tensors in thread pool to not block event loop
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][WORKER] Deserializing tensors..."
-            # )
 
             def deserialize_tensors(
                 tensor_bytes: Dict[str, bytes],
@@ -290,24 +326,14 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             intermediate_tensors = await asyncio.to_thread(
                 deserialize_tensors, intermediate_tensors_bytes
             )
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][WORKER] Deserialized {len(intermediate_tensors.tensors)} tensors"
-            # )
 
-            # Execute the model step
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][WORKER] Executing worker step..."
-            # )
             async with self.pp_lock:
-                result = await self.executor.execute_worker_step(
+                await self.executor.execute_worker_step(
                     scheduler_output_bytes,
                     intermediate_tensors,
                     grpc_metadata,
                     virtual_engine,
                 )
-            # logger.info(
-            #     f"[MoLink][VE{virtual_engine}][WORKER] Worker step completed, result type: {type(result).__name__}"
-            # )
 
             return molink_pb2.GrpcResponseData(res=1)
 
@@ -319,13 +345,5 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
     async def HealthCheck(
         self, request: molink_pb2.HealthCheckRequest, context
     ) -> molink_pb2.HealthCheckResponse:
-        """Health check endpoint.
-
-        Args:
-            request: HealthCheckRequest (empty).
-            context: gRPC context.
-
-        Returns:
-            HealthCheckResponse indicating the service is healthy.
-        """
+        """Health check endpoint."""
         return molink_pb2.HealthCheckResponse(status="healthy")

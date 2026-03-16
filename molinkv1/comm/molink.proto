@@ -21,6 +21,14 @@ message GrpcRequestData {
     IntermediateTensors intermediate_tensors = 2;
     bytes grpc_metadata = 3;  // JSON metadata about pipeline
     int32 virtual_engine = 4;
+
+    // Chunked transfer metadata for prefill transmissions.
+    string transfer_id = 5;
+    bytes chunk_data = 6;
+    int64 chunk_offset = 7;
+    int64 total_bytes = 8;
+    bool is_chunked = 9;
+    bool is_last_chunk = 10;
 }
 
 // Response for gRPC calls
@@ -82,28 +90,28 @@ message ModelConfigData {
 service MolinkService {
     // Join the pipeline as a worker node
     rpc JoinPipeline(NodeInfo) returns (GrpcResponseData);
-    
+
     // Get current pipeline topology
     rpc GetTopology(HealthCheckRequest) returns (PipelineTopology);
-    
+
     // Push intermediate tensors to next pipeline stage
     rpc PushIntermediateTensors(GrpcRequestData) returns (GrpcResponseData);
-    
+
     // Return sampler output to head node
     rpc PushSamplerOutput(SamplerOutput) returns (GrpcResponseData);
-    
+
     // Trigger worker to execute a step
     rpc ExecuteWorkerStep(GrpcTriggerRequest) returns (GrpcResponseData);
-    
+
     // Synchronize KV cache configuration across nodes
     rpc SyncKVCacheConfig(KVCacheConfigData) returns (GrpcResponseData);
-    
+
     // Initialize model on worker node
     rpc InitializeModel(ModelConfigData) returns (GrpcResponseData);
-    
+
     // Health check
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
-    
+
     // Shutdown worker
     rpc Shutdown(HealthCheckRequest) returns (GrpcResponseData);
 }
