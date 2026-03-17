@@ -64,8 +64,10 @@ class TensorDeliveryProcess(mp.Process):
         self,
         max_message_size_mb: int = 200,
         max_waiting_weight: int = 30,
-        max_inflight_sends: int = 2,
-        chunk_size_bytes: int = 512 * 1024,
+        decode_inflight_limit: int = 4,
+        prefill_inflight_limit: int = 1,
+        head_inflight_limit: int = 1,
+        chunk_size_bytes: int = 2 * 1024 * 1024,
     ):
         """Initialize the delivery process.
 
@@ -73,14 +75,18 @@ class TensorDeliveryProcess(mp.Process):
             max_message_size_mb: Maximum gRPC message size in MB.
             max_waiting_weight: Number of decode-priority selections to allow
                 before forcing one prefill transmission.
-            max_inflight_sends: Maximum number of concurrent send tasks.
+            decode_inflight_limit: Maximum number of concurrent decode send tasks.
+            prefill_inflight_limit: Maximum number of concurrent prefill send tasks.
+            head_inflight_limit: Maximum number of concurrent head-output send tasks.
             chunk_size_bytes: Fixed chunk size for prefill chunk transmission.
         """
         super().__init__(daemon=True, name="MolinkTensorDelivery")
 
         self.max_message_size_mb = max_message_size_mb
         self.max_waiting_weight = max_waiting_weight
-        self.max_inflight_sends = max_inflight_sends
+        self.decode_inflight_limit = decode_inflight_limit
+        self.prefill_inflight_limit = prefill_inflight_limit
+        self.head_inflight_limit = head_inflight_limit
         self.chunk_size_bytes = chunk_size_bytes
 
         # Queue for pending deliveries from the main process.
@@ -102,7 +108,9 @@ class TensorDeliveryProcess(mp.Process):
         prefill_queue: Deque[DeliveryItem] = deque()
         head_queue: Deque[DeliveryItem] = deque()
         waiting_weight = 0
-        inflight_tasks: Set[asyncio.Task] = set()
+        head_tasks: Set[asyncio.Task] = set()
+        decode_tasks: Set[asyncio.Task] = set()
+        prefill_tasks: Set[asyncio.Task] = set()
 
         def get_stub(address: str) -> molink_pb2_grpc.MolinkServiceStub:
             if address not in stub_cache:
@@ -370,59 +378,115 @@ class TensorDeliveryProcess(mp.Process):
         def task_target(task: asyncio.Task) -> str:
             return getattr(task, "_molink_target", "unknown")
 
+        def task_class(task: asyncio.Task) -> str:
+            return getattr(task, "_molink_class", "unknown")
+
+        def inflight_total() -> int:
+            return len(head_tasks) + len(decode_tasks) + len(prefill_tasks)
+
         def launch_item(item: DeliveryItem, reason: str) -> None:
             if item.push_type == "head":
                 coro = deliver_sampler_output(item)
+                task_set = head_tasks
+                traffic_class = "head"
             elif item.phase == "prefill":
                 coro = deliver_prefill_chunk(item)
+                task_set = prefill_tasks
+                traffic_class = "prefill"
             else:
                 coro = deliver_intermediate_tensors(item)
+                task_set = decode_tasks
+                traffic_class = "decode"
 
             task = loop.create_task(coro)
             task._molink_phase = item.phase
             task._molink_reason = reason
             task._molink_virtual_engine = item.virtual_engine
             task._molink_target = item.target_server
-            inflight_tasks.add(task)
+            task._molink_class = traffic_class
+            task_set.add(task)
             logger.info(
-                "[MoLink][VE%s][DELIVERY] launch reason=%s phase=%s target=%s inflight=%d decode_q=%d prefill_q=%d head_q=%d",
+                "[MoLink][VE%s][DELIVERY] launch reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d",
                 item.virtual_engine,
                 reason,
                 item.phase,
                 item.target_server,
-                len(inflight_tasks),
+                inflight_total(),
+                len(decode_tasks),
+                len(prefill_tasks),
+                len(head_tasks),
                 len(decode_queue),
                 len(prefill_queue),
                 len(head_queue),
             )
 
         def reap_finished_tasks() -> None:
-            done = [task for task in inflight_tasks if task.done()]
+            done = [
+                task
+                for task in (head_tasks | decode_tasks | prefill_tasks)
+                if task.done()
+            ]
             for task in done:
-                inflight_tasks.remove(task)
+                cls = task_class(task)
+                if cls == "head":
+                    head_tasks.discard(task)
+                elif cls == "decode":
+                    decode_tasks.discard(task)
+                elif cls == "prefill":
+                    prefill_tasks.discard(task)
                 try:
                     task.result()
                     logger.info(
-                        "[MoLink][VE%s][DELIVERY] complete reason=%s phase=%s target=%s inflight=%d",
+                        "[MoLink][VE%s][DELIVERY] complete reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d",
                         task_virtual_engine(task),
                         task_reason(task),
                         task_phase(task),
                         task_target(task),
-                        len(inflight_tasks),
+                        inflight_total(),
+                        len(decode_tasks),
+                        len(prefill_tasks),
+                        len(head_tasks),
                     )
                 except Exception as e:
                     logger.error(
-                        "[MoLink][VE%s][DELIVERY] task_failed reason=%s phase=%s target=%s inflight=%d error=%s",
+                        "[MoLink][VE%s][DELIVERY] task_failed reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d error=%s",
                         task_virtual_engine(task),
                         task_reason(task),
                         task_phase(task),
                         task_target(task),
-                        len(inflight_tasks),
+                        inflight_total(),
+                        len(decode_tasks),
+                        len(prefill_tasks),
+                        len(head_tasks),
                         e,
                     )
 
+        def can_launch(item: DeliveryItem) -> bool:
+            if item.push_type == "head":
+                return len(head_tasks) < self.head_inflight_limit
+            if item.phase == "prefill":
+                return len(prefill_tasks) < self.prefill_inflight_limit
+            return len(decode_tasks) < self.decode_inflight_limit
+
         async def consumer_loop():
             nonlocal waiting_weight
+
+            def schedule_log(item: DeliveryItem, reason: str, observed_weight: int) -> None:
+                logger.info(
+                    "[MoLink][VE%s][DELIVERY] schedule reason=%s phase=%s target=%s W=%d inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d",
+                    item.virtual_engine,
+                    reason,
+                    item.phase,
+                    item.target_server,
+                    observed_weight,
+                    inflight_total(),
+                    len(decode_tasks),
+                    len(prefill_tasks),
+                    len(head_tasks),
+                    len(decode_queue),
+                    len(prefill_queue),
+                    len(head_queue),
+                )
 
             while not self._shutdown.is_set():
                 reap_finished_tasks()
@@ -430,36 +494,55 @@ class TensorDeliveryProcess(mp.Process):
                 if not head_queue and not decode_queue and not prefill_queue:
                     item = await fetch_item(0.1)
                     if item is None:
-                        if inflight_tasks:
+                        if inflight_total():
                             await asyncio.sleep(0.01)
                         continue
                     ingest_item(item)
 
                 drain_nowait()
 
-                while len(inflight_tasks) < self.max_inflight_sends:
+                while head_queue and len(head_tasks) < self.head_inflight_limit:
                     item, reason, observed_weight = choose_next_item()
                     if item is None:
                         break
+                    schedule_log(item, reason, observed_weight)
+                    launch_item(item, reason)
 
-                    logger.info(
-                        "[MoLink][VE%s][DELIVERY] schedule reason=%s phase=%s target=%s W=%d inflight=%d decode_q=%d prefill_q=%d head_q=%d",
-                        item.virtual_engine,
-                        reason,
-                        item.phase,
-                        item.target_server,
-                        observed_weight,
-                        len(inflight_tasks),
-                        len(decode_queue),
-                        len(prefill_queue),
-                        len(head_queue),
-                    )
+                while decode_queue and len(decode_tasks) < self.decode_inflight_limit:
+                    item, reason, observed_weight = choose_next_item()
+                    if item is None:
+                        break
+                    if not can_launch(item):
+                        if item.push_type == "head":
+                            head_queue.appendleft(item)
+                        elif item.phase == "prefill":
+                            prefill_queue.appendleft(item)
+                        else:
+                            decode_queue.appendleft(item)
+                        break
+                    schedule_log(item, reason, observed_weight)
+                    launch_item(item, reason)
+
+                while prefill_queue and len(prefill_tasks) < self.prefill_inflight_limit:
+                    item, reason, observed_weight = choose_next_item()
+                    if item is None:
+                        break
+                    if not can_launch(item):
+                        if item.push_type == "head":
+                            head_queue.appendleft(item)
+                        elif item.phase == "prefill":
+                            prefill_queue.appendleft(item)
+                        else:
+                            decode_queue.appendleft(item)
+                        break
+                    schedule_log(item, reason, observed_weight)
                     launch_item(item, reason)
 
                 await asyncio.sleep(0.01)
 
-            if inflight_tasks:
-                await asyncio.gather(*inflight_tasks, return_exceptions=True)
+            remaining = list(head_tasks | decode_tasks | prefill_tasks)
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
 
         async def main():
             await consumer_loop()
@@ -489,8 +572,10 @@ class TensorDeliveryManager:
         self,
         max_message_size_mb: int = 200,
         max_waiting_weight: int = 30,
-        max_inflight_sends: int = 2,
-        chunk_size_bytes: int = 512 * 1024,
+        decode_inflight_limit: int = 4,
+        prefill_inflight_limit: int = 1,
+        head_inflight_limit: int = 1,
+        chunk_size_bytes: int = 2 * 1024 * 1024,
     ):
         """Initialize the delivery manager.
 
@@ -498,12 +583,16 @@ class TensorDeliveryManager:
             max_message_size_mb: Maximum gRPC message size in MB.
             max_waiting_weight: Number of decode-priority selections to allow
                 before forcing one prefill transmission.
-            max_inflight_sends: Maximum number of concurrent send tasks.
+            decode_inflight_limit: Maximum number of concurrent decode send tasks.
+            prefill_inflight_limit: Maximum number of concurrent prefill send tasks.
+            head_inflight_limit: Maximum number of concurrent head-output send tasks.
             chunk_size_bytes: Fixed chunk size for prefill chunk transmission.
         """
         self.max_message_size_mb = max_message_size_mb
         self.max_waiting_weight = max_waiting_weight
-        self.max_inflight_sends = max_inflight_sends
+        self.decode_inflight_limit = decode_inflight_limit
+        self.prefill_inflight_limit = prefill_inflight_limit
+        self.head_inflight_limit = head_inflight_limit
         self.chunk_size_bytes = chunk_size_bytes
         self._process: Optional[TensorDeliveryProcess] = None
 
@@ -513,7 +602,9 @@ class TensorDeliveryManager:
             self._process = TensorDeliveryProcess(
                 self.max_message_size_mb,
                 max_waiting_weight=self.max_waiting_weight,
-                max_inflight_sends=self.max_inflight_sends,
+                decode_inflight_limit=self.decode_inflight_limit,
+                prefill_inflight_limit=self.prefill_inflight_limit,
+                head_inflight_limit=self.head_inflight_limit,
                 chunk_size_bytes=self.chunk_size_bytes,
             )
             self._process.start()
