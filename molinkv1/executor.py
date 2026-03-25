@@ -627,8 +627,10 @@ class MolinkExecutor(MultiprocExecutor):
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][HEAD] Single node, putting result in output queue"
                 # )
-                # Serialize output for consistency
-                output_bytes = msgspec.json.encode(output)
+                # Keep result serialization consistent with the multi-node path.
+                # Some ModelRunnerOutput variants include tensors, which are not
+                # JSON-serializable via msgspec.
+                output_bytes = cloudpickle.dumps(output)
                 await self.molink_service.output_queue[virtual_engine].put(output_bytes)
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][HEAD] Result placed in output queue"
