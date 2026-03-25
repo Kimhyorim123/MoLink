@@ -49,6 +49,8 @@ class DeliveryItem:
     offset: int = 0
     left_bytes: int = 0
     is_chunked: bool = False
+    scheduled_ts: Optional[float] = None
+    launch_ts: Optional[float] = None
 
 
 class TensorDeliveryProcess(mp.Process):
@@ -290,11 +292,14 @@ class TensorDeliveryProcess(mp.Process):
                 _update_send_stats(item.phase, payload_bytes, (send_end_ts - send_start_ts) * 1000.0)
                 logger.info(
                     "[MoLink][VE%s][DELIVERY] phase=%s target=%s queue_wait_ms=%.3f "
-                    "send_ms=%.3f payload_bytes=%d tensors=%d response=%s",
+                    "schedule_wait_ms=%.3f launch_wait_ms=%.3f send_ms=%.3f "
+                    "payload_bytes=%d tensors=%d response=%s",
                     item.virtual_engine,
                     item.phase,
                     item.target_server,
                     (send_start_ts - item.enqueue_ts) * 1000.0,
+                    ((item.scheduled_ts or send_start_ts) - item.enqueue_ts) * 1000.0,
+                    (send_start_ts - (item.launch_ts or send_start_ts)) * 1000.0,
                     (send_end_ts - send_start_ts) * 1000.0,
                     payload_bytes,
                     len(item.intermediate_tensors_cpu),
@@ -373,8 +378,11 @@ class TensorDeliveryProcess(mp.Process):
         async def deliver_prefill_chunk(item: DeliveryItem):
             try:
                 assert item.grpc_metadata is not None
+                prepare_ms = 0.0
                 if item.serialized_payload is None:
+                    prepare_start_ts = _now_monotonic()
                     _build_chunked_prefill_payload(item)
+                    prepare_ms = (_now_monotonic() - prepare_start_ts) * 1000.0
 
                 chunk_size, ta_case, ta_info = _determine_chunk_size(item)
                 chunk_data, chunk_offset, is_last_chunk = _take_next_chunk(item, chunk_size)
@@ -395,7 +403,7 @@ class TensorDeliveryProcess(mp.Process):
                 send_ms = (send_end_ts - send_start_ts) * 1000.0
                 _update_send_stats(item.phase, len(chunk_data), send_ms)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f send_ms=%.3f response=%s ta_case=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d",
+                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f schedule_wait_ms=%.3f launch_wait_ms=%.3f prepare_ms=%.3f send_ms=%.3f response=%s ta_case=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d",
                     item.virtual_engine,
                     item.phase,
                     item.transfer_id,
@@ -404,6 +412,9 @@ class TensorDeliveryProcess(mp.Process):
                     len(chunk_data),
                     item.left_bytes,
                     (send_start_ts - item.enqueue_ts) * 1000.0,
+                    ((item.scheduled_ts or send_start_ts) - item.enqueue_ts) * 1000.0,
+                    (send_start_ts - (item.launch_ts or send_start_ts)) * 1000.0,
+                    prepare_ms,
                     send_ms,
                     response.res,
                     ta_case,
@@ -559,6 +570,7 @@ class TensorDeliveryProcess(mp.Process):
             return len(head_tasks) + len(decode_tasks) + len(prefill_tasks)
 
         def launch_item(item: DeliveryItem, reason: str) -> None:
+            item.launch_ts = _now_monotonic()
             if item.push_type == "head":
                 coro = deliver_sampler_output(item)
                 task_set = head_tasks
@@ -646,8 +658,10 @@ class TensorDeliveryProcess(mp.Process):
             nonlocal waiting_weight
 
             def schedule_log(item: DeliveryItem, reason: str, observed_weight: int) -> None:
+                now = _now_monotonic()
+                item.scheduled_ts = now
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] schedule reason=%s phase=%s target=%s W=%d inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d",
+                    "[MoLink][VE%s][DELIVERY] schedule reason=%s phase=%s target=%s W=%d inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d enqueue_to_schedule_ms=%.3f",
                     item.virtual_engine,
                     reason,
                     item.phase,
@@ -660,6 +674,7 @@ class TensorDeliveryProcess(mp.Process):
                     len(decode_queue),
                     len(prefill_queue),
                     len(head_queue),
+                    (now - item.enqueue_ts) * 1000.0,
                 )
 
             while not self._shutdown.is_set():
