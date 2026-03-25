@@ -15,6 +15,7 @@ Key design principles:
 import asyncio
 import pickle
 import threading
+import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -46,6 +47,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _now_monotonic() -> float:
+    return time.monotonic()
+
+
 def _classify_scheduler_phase(scheduler_output: "SchedulerOutput") -> str:
     num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {})
     if not num_scheduled_tokens:
@@ -65,6 +70,13 @@ def _classify_scheduler_phase(scheduler_output: "SchedulerOutput") -> str:
     if has_prefill:
         return "prefill"
     return "decode"
+
+
+def _extract_decode_token_count(scheduler_output: "SchedulerOutput") -> int:
+    num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {})
+    return sum(
+        num_tokens for num_tokens in num_scheduled_tokens.values() if num_tokens == 1
+    )
 
 
 class MolinkExecutor(MultiprocExecutor):
@@ -147,6 +159,9 @@ class MolinkExecutor(MultiprocExecutor):
         # Cached stubs for pipeline servers
         self._preset_server_list: List[str] = []
         self._stub_list: List[molink_pb2_grpc.MolinkServiceStub] = []
+
+        # Runtime trace state for adaptive/JIT chunk sizing experiments.
+        self._jit_trace_by_ve: Dict[int, Dict[str, Any]] = {}
         # Initialize parent executor
         super().__init__(vllm_config, monitor_workers=monitor_workers)
 
@@ -331,6 +346,75 @@ class MolinkExecutor(MultiprocExecutor):
         self._preset_server_list = server_list
         self._stub_list = [self._get_stub(server) for server in server_list]
 
+    def _build_trace_snapshot(
+        self,
+        virtual_engine: int,
+        scheduler_output: "SchedulerOutput",
+        transmission_phase: str,
+    ) -> Dict[str, Any]:
+        state = self._jit_trace_by_ve.get(virtual_engine, {})
+        return {
+            "trace_seq": state.get("trace_seq", 0),
+            "transmission_phase": transmission_phase,
+            "total_scheduled_tokens": getattr(
+                scheduler_output, "total_num_scheduled_tokens", 0
+            ),
+            "decode_token_count": _extract_decode_token_count(scheduler_output),
+            "last_decode_start_ts": state.get("last_decode_start_ts"),
+            "last_decode_finish_ts": state.get("last_decode_finish_ts"),
+            "last_decode_duration_ms": state.get("last_decode_duration_ms"),
+            "last_decode_tokens": state.get("last_decode_tokens"),
+            "last_exec_start_ts": state.get("last_exec_start_ts"),
+            "last_exec_finish_ts": state.get("last_exec_finish_ts"),
+            "last_exec_duration_ms": state.get("last_exec_duration_ms"),
+            "last_exec_phase": state.get("last_exec_phase"),
+        }
+
+    def _record_exec_trace(
+        self,
+        virtual_engine: int,
+        scheduler_output: "SchedulerOutput",
+        transmission_phase: str,
+        exec_start_ts: float,
+        exec_end_ts: float,
+    ) -> Dict[str, Any]:
+        exec_duration_ms = (exec_end_ts - exec_start_ts) * 1000.0
+        decode_tokens = _extract_decode_token_count(scheduler_output)
+        state = dict(self._jit_trace_by_ve.get(virtual_engine, {}))
+        state["trace_seq"] = int(state.get("trace_seq", 0)) + 1
+        state["last_exec_start_ts"] = exec_start_ts
+        state["last_exec_finish_ts"] = exec_end_ts
+        state["last_exec_duration_ms"] = exec_duration_ms
+        state["last_exec_phase"] = transmission_phase
+        state["last_total_scheduled_tokens"] = getattr(
+            scheduler_output, "total_num_scheduled_tokens", 0
+        )
+
+        if transmission_phase in {"decode", "mixed"} and decode_tokens > 0:
+            state["last_decode_start_ts"] = exec_start_ts
+            state["last_decode_finish_ts"] = exec_end_ts
+            state["last_decode_duration_ms"] = exec_duration_ms
+            state["last_decode_tokens"] = decode_tokens
+
+        self._jit_trace_by_ve[virtual_engine] = state
+
+        trace_snapshot = self._build_trace_snapshot(
+            virtual_engine, scheduler_output, transmission_phase
+        )
+        trace_snapshot["current_exec_start_ts"] = exec_start_ts
+        trace_snapshot["current_exec_finish_ts"] = exec_end_ts
+        trace_snapshot["current_exec_duration_ms"] = exec_duration_ms
+        logger.info(
+            "[MoLink][VE%s][TRACE] phase=%s exec_ms=%.3f total_tokens=%d decode_tokens=%d trace_seq=%d",
+            virtual_engine,
+            transmission_phase,
+            exec_duration_ms,
+            getattr(scheduler_output, "total_num_scheduled_tokens", 0),
+            decode_tokens,
+            trace_snapshot["trace_seq"],
+        )
+        return trace_snapshot
+
     def execute_model(
         self, scheduler_output: "SchedulerOutput", non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
@@ -385,9 +469,15 @@ class MolinkExecutor(MultiprocExecutor):
             grpc_metadata = dict(grpc_metadata)
             transmission_phase = _classify_scheduler_phase(scheduler_output)
             grpc_metadata["transmission_phase"] = transmission_phase
-            server_list = grpc_metadata.get("server_list", [])
 
             virtual_engine = getattr(scheduler_output, "virtual_engine", 0)
+            grpc_metadata["jit_runtime_trace"] = self._build_trace_snapshot(
+                virtual_engine,
+                scheduler_output,
+                transmission_phase,
+            )
+            server_list = grpc_metadata.get("server_list", [])
+
             logger.info(
                 "[MoLink][VE%s] scheduler_phase=%s total_tokens=%s new_reqs=%s cached_reqs=%s",
                 virtual_engine,
@@ -447,7 +537,10 @@ class MolinkExecutor(MultiprocExecutor):
             # Execute on head node
             head_task = asyncio.create_task(
                 self._executing_head_server(
-                    scheduler_output, scheduler_output_bytes, grpc_metadata
+                    scheduler_output,
+                    scheduler_output_bytes,
+                    grpc_metadata,
+                    transmission_phase,
                 )
             )
 
@@ -493,6 +586,7 @@ class MolinkExecutor(MultiprocExecutor):
         scheduler_output: "SchedulerOutput",
         scheduler_output_bytes: bytes,
         grpc_metadata: Dict[str, Any],
+        transmission_phase: str,
     ) -> None:
         """Execute model on the head node and handle results.
 
@@ -511,10 +605,20 @@ class MolinkExecutor(MultiprocExecutor):
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][HEAD] Calling _driver_exec_model"
                 # )
+                exec_start_ts = _now_monotonic()
                 output = await self._driver_exec_model(scheduler_output)
+                exec_end_ts = _now_monotonic()
                 # logger.info(
                 #     f"[MoLink][VE{virtual_engine}][HEAD] _driver_exec_model completed, output type: {type(output).__name__}"
                 # )
+
+            grpc_metadata["jit_runtime_trace"] = self._record_exec_trace(
+                virtual_engine,
+                scheduler_output,
+                transmission_phase,
+                exec_start_ts,
+                exec_end_ts,
+            )
 
             server_list = grpc_metadata.get("server_list", [])
 
@@ -691,8 +795,18 @@ class MolinkExecutor(MultiprocExecutor):
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Calling _driver_exec_model"
             # )
+            exec_start_ts = _now_monotonic()
             output = await self._driver_exec_model(
                 scheduler_output, intermediate_tensors
+            )
+            exec_end_ts = _now_monotonic()
+            transmission_phase = grpc_metadata.get("transmission_phase", "unknown")
+            grpc_metadata["jit_runtime_trace"] = self._record_exec_trace(
+                virtual_engine,
+                scheduler_output,
+                transmission_phase,
+                exec_start_ts,
+                exec_end_ts,
             )
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] _driver_exec_model completed, output type: {type(output).__name__}"

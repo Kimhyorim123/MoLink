@@ -68,6 +68,8 @@ class TensorDeliveryProcess(mp.Process):
         prefill_inflight_limit: int = 1,
         head_inflight_limit: int = 1,
         chunk_size_bytes: int = 2 * 1024 * 1024,
+        min_chunk_size_bytes: int = 256 * 1024,
+        max_chunk_size_bytes: int = 8 * 1024 * 1024,
     ):
         """Initialize the delivery process.
 
@@ -78,7 +80,9 @@ class TensorDeliveryProcess(mp.Process):
             decode_inflight_limit: Maximum number of concurrent decode send tasks.
             prefill_inflight_limit: Maximum number of concurrent prefill send tasks.
             head_inflight_limit: Maximum number of concurrent head-output send tasks.
-            chunk_size_bytes: Fixed chunk size for prefill chunk transmission.
+            chunk_size_bytes: Fixed fallback chunk size for prefill transmission.
+            min_chunk_size_bytes: Minimum adaptive chunk size.
+            max_chunk_size_bytes: Maximum adaptive chunk size.
         """
         super().__init__(daemon=True, name="MolinkTensorDelivery")
 
@@ -88,6 +92,8 @@ class TensorDeliveryProcess(mp.Process):
         self.prefill_inflight_limit = prefill_inflight_limit
         self.head_inflight_limit = head_inflight_limit
         self.chunk_size_bytes = chunk_size_bytes
+        self.min_chunk_size_bytes = min_chunk_size_bytes
+        self.max_chunk_size_bytes = max_chunk_size_bytes
 
         # Queue for pending deliveries from the main process.
         self.delivery_queue: mp.Queue = mp.Queue(maxsize=100)
@@ -112,6 +118,15 @@ class TensorDeliveryProcess(mp.Process):
         decode_tasks: Set[asyncio.Task] = set()
         prefill_tasks: Set[asyncio.Task] = set()
 
+        runtime_stats: Dict[str, Optional[float]] = {
+            "decode_bytes_per_ms_ema": None,
+            "prefill_bytes_per_ms_ema": None,
+            "decode_send_ms_ema": None,
+            "prefill_send_ms_ema": None,
+            "decode_arrival_gap_ms_ema": None,
+            "last_decode_arrival_ts": None,
+        }
+
         def get_stub(address: str) -> molink_pb2_grpc.MolinkServiceStub:
             if address not in stub_cache:
                 channel = aio.insecure_channel(
@@ -120,6 +135,110 @@ class TensorDeliveryProcess(mp.Process):
                 channel_cache[address] = channel
                 stub_cache[address] = molink_pb2_grpc.MolinkServiceStub(channel)
             return stub_cache[address]
+
+        def _ema_update(current: Optional[float], value: float, alpha: float = 0.2) -> float:
+            if current is None:
+                return value
+            return (1.0 - alpha) * current + alpha * value
+
+        def _update_send_stats(phase: str, sent_bytes: int, send_ms: float) -> None:
+            if send_ms <= 0:
+                return
+            bytes_per_ms = sent_bytes / send_ms
+            if phase == "prefill":
+                runtime_stats["prefill_send_ms_ema"] = _ema_update(
+                    runtime_stats["prefill_send_ms_ema"], send_ms
+                )
+                runtime_stats["prefill_bytes_per_ms_ema"] = _ema_update(
+                    runtime_stats["prefill_bytes_per_ms_ema"], bytes_per_ms
+                )
+            else:
+                runtime_stats["decode_send_ms_ema"] = _ema_update(
+                    runtime_stats["decode_send_ms_ema"], send_ms
+                )
+                runtime_stats["decode_bytes_per_ms_ema"] = _ema_update(
+                    runtime_stats["decode_bytes_per_ms_ema"], bytes_per_ms
+                )
+
+        def _record_decode_arrival(enqueue_ts: float) -> None:
+            last_arrival = runtime_stats.get("last_decode_arrival_ts")
+            if last_arrival is not None:
+                gap_ms = max((enqueue_ts - last_arrival) * 1000.0, 0.0)
+                runtime_stats["decode_arrival_gap_ms_ema"] = _ema_update(
+                    runtime_stats["decode_arrival_gap_ms_ema"], gap_ms
+                )
+            runtime_stats["last_decode_arrival_ts"] = enqueue_ts
+
+        def _estimate_available_time_ms(item: DeliveryItem, tc: float) -> tuple[float, str, Dict[str, Any]]:
+            trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
+            ts = trace.get("current_exec_start_ts")
+            tf = trace.get("current_exec_finish_ts")
+            last_decode_finish_ts = trace.get("last_decode_finish_ts")
+            decode_duration_ms = trace.get("last_decode_duration_ms")
+            if decode_duration_ms is None:
+                decode_duration_ms = trace.get("current_exec_duration_ms")
+            if decode_duration_ms is None:
+                decode_duration_ms = runtime_stats.get("decode_send_ms_ema")
+            if decode_duration_ms is None:
+                decode_duration_ms = 5.0
+
+            bandwidth_bytes_per_ms = (
+                runtime_stats.get("prefill_bytes_per_ms_ema")
+                or runtime_stats.get("decode_bytes_per_ms_ema")
+                or max(self.chunk_size_bytes / max(decode_duration_ms, 1.0), 1.0)
+            )
+            decode_tokens = trace.get("decode_token_count") or trace.get("last_decode_tokens") or 1
+            token_bytes = 2 * int(decode_tokens)
+            tm_ms = runtime_stats.get("decode_send_ms_ema")
+            if tm_ms is None:
+                tm_ms = max(token_bytes / max(bandwidth_bytes_per_ms, 1.0), 0.1)
+            to_ms = decode_duration_ms
+            info: Dict[str, Any] = {
+                "tc": tc,
+                "ts": ts,
+                "tf": tf,
+                "tp": last_decode_finish_ts,
+                "Td_ms": decode_duration_ms,
+                "Tm_ms": tm_ms,
+                "To_ms": to_ms,
+                "decode_tokens": decode_tokens,
+                "bandwidth_bytes_per_ms": bandwidth_bytes_per_ms,
+            }
+
+            epsilon_s = 0.002
+            if ts is not None and abs(tc - ts) <= epsilon_s:
+                ta_ms = max(decode_duration_ms, 0.1)
+                info["Ta_ms"] = ta_ms
+                return ta_ms, "case1", info
+
+            if ts is not None and tf is not None and tc > ts and tc < tf:
+                ta_ms = max((tf - tc) * 1000.0, 0.1)
+                info["Ta_ms"] = ta_ms
+                return ta_ms, "case2", info
+
+            tp = last_decode_finish_ts
+            if tp is None:
+                tp = tf if tf is not None else tc
+            predicted_tf = tp + (to_ms + tm_ms) / 1000.0
+            ta_ms = max((predicted_tf - tc) * 1000.0, 0.1)
+            info["predicted_tf"] = predicted_tf
+            info["Ta_ms"] = ta_ms
+            return ta_ms, "case3", info
+
+        def _determine_chunk_size(item: DeliveryItem) -> tuple[int, str, Dict[str, Any]]:
+            tc = _now_monotonic()
+            ta_ms, ta_case, info = _estimate_available_time_ms(item, tc)
+            bandwidth_bytes_per_ms = info["bandwidth_bytes_per_ms"]
+            dynamic_size = int(max(bandwidth_bytes_per_ms * ta_ms * 0.9, 1.0))
+            chunk_size = min(item.left_bytes or item.total_bytes, dynamic_size)
+            chunk_size = max(self.min_chunk_size_bytes, chunk_size)
+            chunk_size = min(self.max_chunk_size_bytes, chunk_size)
+            chunk_size = min(chunk_size, item.left_bytes or item.total_bytes)
+            if chunk_size <= 0:
+                chunk_size = min(self.chunk_size_bytes, item.left_bytes or item.total_bytes)
+                info["fallback"] = "fixed_chunk"
+            info["selected_chunk_size"] = chunk_size
+            return chunk_size, ta_case, info
 
         async def deliver_intermediate_tensors(item: DeliveryItem):
             """Deliver intermediate tensors to the next pipeline stage."""
@@ -151,6 +270,7 @@ class TensorDeliveryProcess(mp.Process):
                 stub = get_stub(item.target_server)
                 response = await stub.PushIntermediateTensors(request)
                 send_end_ts = _now_monotonic()
+                _update_send_stats(item.phase, payload_bytes, (send_end_ts - send_start_ts) * 1000.0)
                 logger.info(
                     "[MoLink][VE%s][DELIVERY] phase=%s target=%s queue_wait_ms=%.3f "
                     "send_ms=%.3f payload_bytes=%d tensors=%d response=%s",
@@ -210,20 +330,23 @@ class TensorDeliveryProcess(mp.Process):
             item.offset = 0
             item.left_bytes = len(payload)
             item.is_chunked = True
+            trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
             logger.info(
-                "[MoLink][VE%s][DELIVERY] chunk_prepare phase=%s transfer_id=%s total_bytes=%d chunk_size=%d target=%s",
+                "[MoLink][VE%s][DELIVERY] chunk_prepare phase=%s transfer_id=%s total_bytes=%d fallback_chunk_size=%d target=%s trace_seq=%s decode_tokens=%s",
                 item.virtual_engine,
                 item.phase,
                 item.transfer_id,
                 item.total_bytes,
                 self.chunk_size_bytes,
                 item.target_server,
+                trace.get("trace_seq"),
+                trace.get("decode_token_count"),
             )
 
-        def _take_next_chunk(item: DeliveryItem) -> tuple[bytes, int, bool]:
+        def _take_next_chunk(item: DeliveryItem, chunk_size: int) -> tuple[bytes, int, bool]:
             assert item.serialized_payload is not None
             start = item.offset
-            end = min(start + self.chunk_size_bytes, item.total_bytes)
+            end = min(start + chunk_size, item.total_bytes)
             chunk = item.serialized_payload[start:end]
             item.offset = end
             item.left_bytes = item.total_bytes - item.offset
@@ -236,7 +359,8 @@ class TensorDeliveryProcess(mp.Process):
                 if item.serialized_payload is None:
                     _build_chunked_prefill_payload(item)
 
-                chunk_data, chunk_offset, is_last_chunk = _take_next_chunk(item)
+                chunk_size, ta_case, ta_info = _determine_chunk_size(item)
+                chunk_data, chunk_offset, is_last_chunk = _take_next_chunk(item, chunk_size)
                 send_start_ts = _now_monotonic()
                 request = molink_pb2.GrpcRequestData(
                     grpc_metadata=serialize_metadata(item.grpc_metadata),
@@ -251,8 +375,10 @@ class TensorDeliveryProcess(mp.Process):
                 stub = get_stub(item.target_server)
                 response = await stub.PushIntermediateTensors(request)
                 send_end_ts = _now_monotonic()
+                send_ms = (send_end_ts - send_start_ts) * 1000.0
+                _update_send_stats(item.phase, len(chunk_data), send_ms)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f send_ms=%.3f response=%s",
+                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f send_ms=%.3f response=%s ta_case=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d",
                     item.virtual_engine,
                     item.phase,
                     item.transfer_id,
@@ -261,8 +387,14 @@ class TensorDeliveryProcess(mp.Process):
                     len(chunk_data),
                     item.left_bytes,
                     (send_start_ts - item.enqueue_ts) * 1000.0,
-                    (send_end_ts - send_start_ts) * 1000.0,
+                    send_ms,
                     response.res,
+                    ta_case,
+                    float(ta_info.get("Ta_ms", 0.0)),
+                    float(ta_info.get("Td_ms", 0.0)),
+                    float(ta_info.get("Tm_ms", 0.0)),
+                    float(ta_info.get("To_ms", 0.0)),
+                    chunk_size,
                 )
                 if item.left_bytes > 0:
                     item.enqueue_ts = _now_monotonic()
@@ -301,6 +433,7 @@ class TensorDeliveryProcess(mp.Process):
                 return
 
             if item.phase in {"decode", "mixed"}:
+                _record_decode_arrival(item.enqueue_ts)
                 decode_queue.append(item)
                 queue_name = "decode"
                 queue_len = len(decode_queue)
@@ -309,8 +442,9 @@ class TensorDeliveryProcess(mp.Process):
                 queue_name = "prefill"
                 queue_len = len(prefill_queue)
 
+            trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
             logger.info(
-                "[MoLink][VE%s][DELIVERY] classify phase=%s route=%s target=%s decode_q=%d prefill_q=%d selected_q_len=%d",
+                "[MoLink][VE%s][DELIVERY] classify phase=%s route=%s target=%s decode_q=%d prefill_q=%d selected_q_len=%d trace_seq=%s last_decode_finish_ts=%s",
                 item.virtual_engine,
                 item.phase,
                 queue_name,
@@ -318,6 +452,8 @@ class TensorDeliveryProcess(mp.Process):
                 len(decode_queue),
                 len(prefill_queue),
                 queue_len,
+                trace.get("trace_seq"),
+                trace.get("last_decode_finish_ts"),
             )
 
         async def fetch_item(timeout: float) -> Optional[DeliveryItem]:
@@ -576,6 +712,8 @@ class TensorDeliveryManager:
         prefill_inflight_limit: int = 1,
         head_inflight_limit: int = 1,
         chunk_size_bytes: int = 2 * 1024 * 1024,
+        min_chunk_size_bytes: int = 256 * 1024,
+        max_chunk_size_bytes: int = 8 * 1024 * 1024,
     ):
         """Initialize the delivery manager.
 
@@ -586,7 +724,9 @@ class TensorDeliveryManager:
             decode_inflight_limit: Maximum number of concurrent decode send tasks.
             prefill_inflight_limit: Maximum number of concurrent prefill send tasks.
             head_inflight_limit: Maximum number of concurrent head-output send tasks.
-            chunk_size_bytes: Fixed chunk size for prefill chunk transmission.
+            chunk_size_bytes: Fixed fallback chunk size for prefill transmission.
+            min_chunk_size_bytes: Minimum adaptive chunk size.
+            max_chunk_size_bytes: Maximum adaptive chunk size.
         """
         self.max_message_size_mb = max_message_size_mb
         self.max_waiting_weight = max_waiting_weight
@@ -594,6 +734,8 @@ class TensorDeliveryManager:
         self.prefill_inflight_limit = prefill_inflight_limit
         self.head_inflight_limit = head_inflight_limit
         self.chunk_size_bytes = chunk_size_bytes
+        self.min_chunk_size_bytes = min_chunk_size_bytes
+        self.max_chunk_size_bytes = max_chunk_size_bytes
         self._process: Optional[TensorDeliveryProcess] = None
 
     def start(self):
@@ -606,6 +748,8 @@ class TensorDeliveryManager:
                 prefill_inflight_limit=self.prefill_inflight_limit,
                 head_inflight_limit=self.head_inflight_limit,
                 chunk_size_bytes=self.chunk_size_bytes,
+                min_chunk_size_bytes=self.min_chunk_size_bytes,
+                max_chunk_size_bytes=self.max_chunk_size_bytes,
             )
             self._process.start()
             logger.info("Tensor delivery process started")

@@ -197,12 +197,15 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
         grpc_metadata = deserialize_metadata(request.grpc_metadata)
         phase = grpc_metadata.get("transmission_phase", "unknown")
 
+        trace = grpc_metadata.get("jit_runtime_trace", {})
         logger.info(
-            "[MoLink][VE%s][SERVICE] received phase=%s scheduler_bytes=%d tensors=%d",
+            "[MoLink][VE%s][SERVICE] received phase=%s scheduler_bytes=%d tensors=%d trace_seq=%s decode_tokens=%s",
             virtual_engine,
             phase,
             len(scheduler_output_bytes),
             len(intermediate_tensors_bytes),
+            trace.get("trace_seq"),
+            trace.get("decode_token_count"),
         )
 
         await self.input_queue[virtual_engine].put(
@@ -223,8 +226,9 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
 
         async with self.partial_transfer_lock:
             state = self._store_chunk(request, grpc_metadata)
+            trace = grpc_metadata.get("jit_runtime_trace", {})
             logger.info(
-                "[MoLink][VE%s][SERVICE] chunk_recv phase=%s transfer_id=%s offset=%d chunk_bytes=%d received=%d total=%d",
+                "[MoLink][VE%s][SERVICE] chunk_recv phase=%s transfer_id=%s offset=%d chunk_bytes=%d received=%d total=%d trace_seq=%s",
                 request.virtual_engine,
                 phase,
                 request.transfer_id,
@@ -232,6 +236,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
                 len(request.chunk_data),
                 state.received_bytes,
                 state.total_bytes,
+                trace.get("trace_seq"),
             )
 
             if not self._is_chunk_complete(state):
