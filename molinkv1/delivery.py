@@ -203,17 +203,26 @@ class TensorDeliveryProcess(mp.Process):
                 "To_ms": to_ms,
                 "decode_tokens": decode_tokens,
                 "bandwidth_bytes_per_ms": bandwidth_bytes_per_ms,
+                "decode_q_len": len(decode_queue),
+                "prefill_q_len": len(prefill_queue),
+                "head_q_len": len(head_queue),
+                "current_exec_start_ts": trace.get("current_exec_start_ts"),
+                "current_exec_finish_ts": trace.get("current_exec_finish_ts"),
+                "last_decode_finish_ts": last_decode_finish_ts,
+                "trace_seq": trace.get("trace_seq"),
             }
 
             epsilon_s = 0.002
             if ts is not None and abs(tc - ts) <= epsilon_s:
                 ta_ms = max(decode_duration_ms, 0.1)
                 info["Ta_ms"] = ta_ms
+                info["case_reason"] = "tc_almost_equals_ts"
                 return ta_ms, "case1", info
 
             if ts is not None and tf is not None and tc > ts and tc < tf:
                 ta_ms = max((tf - tc) * 1000.0, 0.1)
                 info["Ta_ms"] = ta_ms
+                info["case_reason"] = "tc_inside_current_decode_window"
                 return ta_ms, "case2", info
 
             tp = last_decode_finish_ts
@@ -223,6 +232,14 @@ class TensorDeliveryProcess(mp.Process):
             ta_ms = max((predicted_tf - tc) * 1000.0, 0.1)
             info["predicted_tf"] = predicted_tf
             info["Ta_ms"] = ta_ms
+            if ts is None:
+                info["case_reason"] = "no_decode_window_available"
+            elif tf is None:
+                info["case_reason"] = "decode_start_without_finish"
+            elif tc <= ts:
+                info["case_reason"] = "tc_before_decode_window"
+            else:
+                info["case_reason"] = "tc_after_decode_window"
             return ta_ms, "case3", info
 
         def _determine_chunk_size(item: DeliveryItem) -> tuple[int, str, Dict[str, Any]]:
@@ -395,6 +412,27 @@ class TensorDeliveryProcess(mp.Process):
                     float(ta_info.get("Tm_ms", 0.0)),
                     float(ta_info.get("To_ms", 0.0)),
                     chunk_size,
+                )
+                logger.info(
+                    "[MoLink][VE%s][DELIVERY][JIT] ta_case=%s reason=%s tc=%.6f ts=%s tf=%s predicted_tf=%s "
+                    "trace_seq=%s current_exec_start_ts=%s current_exec_finish_ts=%s last_decode_finish_ts=%s "
+                    "decode_q=%s prefill_q=%s head_q=%s decode_tokens=%s bw_bytes_per_ms=%.3f",
+                    item.virtual_engine,
+                    ta_case,
+                    ta_info.get("case_reason"),
+                    float(ta_info.get("tc", 0.0)),
+                    ta_info.get("ts"),
+                    ta_info.get("tf"),
+                    ta_info.get("predicted_tf"),
+                    ta_info.get("trace_seq"),
+                    ta_info.get("current_exec_start_ts"),
+                    ta_info.get("current_exec_finish_ts"),
+                    ta_info.get("last_decode_finish_ts"),
+                    ta_info.get("decode_q_len"),
+                    ta_info.get("prefill_q_len"),
+                    ta_info.get("head_q_len"),
+                    ta_info.get("decode_tokens"),
+                    float(ta_info.get("bandwidth_bytes_per_ms", 0.0)),
                 )
                 if item.left_bytes > 0:
                     item.enqueue_ts = _now_monotonic()
