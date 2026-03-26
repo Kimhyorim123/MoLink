@@ -426,7 +426,7 @@ class TensorDeliveryProcess(mp.Process):
                 send_ms = (send_end_ts - send_start_ts) * 1000.0
                 _update_send_stats(item.phase, len(chunk_data), send_ms)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f schedule_wait_ms=%.3f launch_wait_ms=%.3f prepare_ms=%.3f send_ms=%.3f response=%s ta_case=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d",
+                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f schedule_wait_ms=%.3f launch_wait_ms=%.3f prepare_ms=%.3f send_ms=%.3f response=%s ta_case=%s fallback=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d",
                     item.virtual_engine,
                     item.phase,
                     item.transfer_id,
@@ -441,6 +441,7 @@ class TensorDeliveryProcess(mp.Process):
                     send_ms,
                     response.res,
                     ta_case,
+                    ta_info.get("fallback"),
                     float(ta_info.get("Ta_ms", 0.0)),
                     float(ta_info.get("Td_ms", 0.0)),
                     float(ta_info.get("Tm_ms", 0.0)),
@@ -448,12 +449,13 @@ class TensorDeliveryProcess(mp.Process):
                     chunk_size,
                 )
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY][JIT] ta_case=%s reason=%s tc=%.6f ts=%s tf=%s predicted_tf=%s "
+                    "[MoLink][VE%s][DELIVERY][JIT] ta_case=%s reason=%s fallback=%s tc=%.6f ts=%s tf=%s predicted_tf=%s "
                     "predicted_ts=%s trace_seq=%s current_exec_start_ts=%s current_exec_finish_ts=%s last_decode_finish_ts=%s "
                     "decode_q=%s prefill_q=%s head_q=%s decode_tokens=%s bw_bytes_per_ms=%.3f",
                     item.virtual_engine,
                     ta_case,
                     ta_info.get("case_reason"),
+                    ta_info.get("fallback"),
                     float(ta_info.get("tc", 0.0)),
                     ta_info.get("ts"),
                     ta_info.get("tf"),
