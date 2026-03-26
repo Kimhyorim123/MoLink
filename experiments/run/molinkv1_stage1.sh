@@ -28,7 +28,8 @@ CHUNKED_PREFILL=${CHUNKED_PREFILL:-0}
 export HF_HOME=${HF_HOME:-"/home/sslab/hf_cache"}
 export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-"/home/sslab/hf_cache"}
 export HF_MODULES_CACHE=${HF_MODULES_CACHE:-"${HF_HOME}/modules"}
-export PYTHONPATH="${HF_MODULES_CACHE}:${PYTHONPATH:-}"
+# Prefer the checked-out runtime tree over any editable install in the venv.
+export PYTHONPATH="${ROOT_DIR}:${HF_MODULES_CACHE}:${PYTHONPATH:-}"
 
 # Avoid permission issues with default ~/.cache/vllm paths on some nodes.
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-"${ROOT_DIR}/.runtime/vllm_cache"}
