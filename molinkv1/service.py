@@ -252,7 +252,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
             virtual_engine,
         ) = self._decode_chunked_payload(full_payload)
 
-        logger.info(
+        logger.error(
             "[MoLink][VE%s][SERVICE] chunk_complete phase=%s transfer_id=%s total_bytes=%d scheduler_bytes=%d tensors=%d",
             virtual_engine,
             grpc_metadata.get("transmission_phase", "unknown"),
@@ -307,7 +307,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
         try:
             virtual_engine = request.virtual_engine
             trigger_scheduler_output_bytes = request.scheduler_output
-            logger.info(
+            logger.error(
                 "[MoLink][VE%s][WORKER] trigger received trigger_scheduler_bytes=%d",
                 virtual_engine,
                 len(trigger_scheduler_output_bytes),
@@ -327,7 +327,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
                     )
                     scheduler_output_bytes = trigger_scheduler_output_bytes
                 phase = grpc_metadata.get("transmission_phase", "unknown")
-                logger.info(
+                logger.error(
                     "[MoLink][VE%s][WORKER] dequeued phase=%s scheduler_bytes=%d trigger_scheduler_bytes=%d tensors=%d",
                     virtual_engine,
                     phase,

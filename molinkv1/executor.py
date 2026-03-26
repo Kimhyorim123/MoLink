@@ -555,6 +555,13 @@ class MolinkExecutor(MultiprocExecutor):
             worker_servers = server_list[1:]
             self._update_stub_list(worker_servers)
 
+            logger.error(
+                "[MoLink][VE%s][HEAD] trigger_send scheduler_bytes=%d workers=%d phase=%s",
+                virtual_engine,
+                len(scheduler_output_bytes),
+                len(worker_servers),
+                transmission_phase,
+            )
             trigger_request = molink_pb2.GrpcTriggerRequest(
                 virtual_engine=virtual_engine,
                 scheduler_output=scheduler_output_bytes,
@@ -784,6 +791,21 @@ class MolinkExecutor(MultiprocExecutor):
             # )
 
             # Deserialize scheduler output using cloudpickle
+            if not scheduler_output_bytes:
+                logger.error(
+                    "[MoLink][VE%s][WORKER] empty scheduler_output_bytes before deserialize phase=%s tensors=%d",
+                    virtual_engine,
+                    grpc_metadata.get("transmission_phase", "unknown"),
+                    len(intermediate_tensors),
+                )
+                raise RuntimeError("Empty scheduler_output_bytes on worker")
+            logger.error(
+                "[MoLink][VE%s][WORKER] deserialize scheduler_bytes=%d phase=%s tensors=%d",
+                virtual_engine,
+                len(scheduler_output_bytes),
+                grpc_metadata.get("transmission_phase", "unknown"),
+                len(intermediate_tensors),
+            )
             scheduler_output = cloudpickle.loads(scheduler_output_bytes)
             # logger.info(
             #     f"[MoLink][VE{virtual_engine}][WORKER_STEP] Deserialized scheduler output"
