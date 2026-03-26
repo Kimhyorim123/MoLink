@@ -304,6 +304,7 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
         """Execute a forward step on this worker node."""
         try:
             virtual_engine = request.virtual_engine
+            trigger_scheduler_output_bytes = request.scheduler_output
             try:
                 scheduler_output_bytes, intermediate_tensors_bytes, grpc_metadata = (
                     await asyncio.wait_for(
@@ -311,12 +312,20 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
                         timeout=WORKER_INPUT_TIMEOUT_S
                     )
                 )
+                if not scheduler_output_bytes and trigger_scheduler_output_bytes:
+                    logger.warning(
+                        "[MoLink][VE%s][WORKER] empty scheduler bytes from input queue; using trigger fallback bytes=%d",
+                        virtual_engine,
+                        len(trigger_scheduler_output_bytes),
+                    )
+                    scheduler_output_bytes = trigger_scheduler_output_bytes
                 phase = grpc_metadata.get("transmission_phase", "unknown")
                 logger.info(
-                    "[MoLink][VE%s][WORKER] dequeued phase=%s scheduler_bytes=%d tensors=%d",
+                    "[MoLink][VE%s][WORKER] dequeued phase=%s scheduler_bytes=%d trigger_scheduler_bytes=%d tensors=%d",
                     virtual_engine,
                     phase,
                     len(scheduler_output_bytes),
+                    len(trigger_scheduler_output_bytes),
                     len(intermediate_tensors_bytes),
                 )
             except asyncio.TimeoutError:

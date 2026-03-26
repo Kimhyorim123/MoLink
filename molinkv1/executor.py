@@ -556,7 +556,8 @@ class MolinkExecutor(MultiprocExecutor):
             self._update_stub_list(worker_servers)
 
             trigger_request = molink_pb2.GrpcTriggerRequest(
-                virtual_engine=virtual_engine
+                virtual_engine=virtual_engine,
+                scheduler_output=scheduler_output_bytes,
             )
 
             # Trigger all worker nodes asynchronously
