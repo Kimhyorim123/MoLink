@@ -253,11 +253,13 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
         ) = self._decode_chunked_payload(full_payload)
 
         logger.info(
-            "[MoLink][VE%s][SERVICE] chunk_complete phase=%s transfer_id=%s total_bytes=%d",
+            "[MoLink][VE%s][SERVICE] chunk_complete phase=%s transfer_id=%s total_bytes=%d scheduler_bytes=%d tensors=%d",
             virtual_engine,
             grpc_metadata.get("transmission_phase", "unknown"),
             request.transfer_id,
             len(full_payload),
+            len(scheduler_output_bytes),
+            len(intermediate_tensors_bytes),
         )
 
         await self.input_queue[virtual_engine].put(
@@ -305,6 +307,11 @@ class MolinkService(molink_pb2_grpc.MolinkServiceServicer):
         try:
             virtual_engine = request.virtual_engine
             trigger_scheduler_output_bytes = request.scheduler_output
+            logger.info(
+                "[MoLink][VE%s][WORKER] trigger received trigger_scheduler_bytes=%d",
+                virtual_engine,
+                len(trigger_scheduler_output_bytes),
+            )
             try:
                 scheduler_output_bytes, intermediate_tensors_bytes, grpc_metadata = (
                     await asyncio.wait_for(
