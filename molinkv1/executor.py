@@ -368,6 +368,9 @@ class MolinkExecutor(MultiprocExecutor):
             "last_exec_finish_ts": state.get("last_exec_finish_ts"),
             "last_exec_duration_ms": state.get("last_exec_duration_ms"),
             "last_exec_phase": state.get("last_exec_phase"),
+            "decode_window_start_ts": state.get("last_decode_start_ts"),
+            "decode_window_finish_ts": state.get("last_decode_finish_ts"),
+            "decode_window_duration_ms": state.get("last_decode_duration_ms"),
         }
 
     def _record_exec_trace(
@@ -404,6 +407,10 @@ class MolinkExecutor(MultiprocExecutor):
         trace_snapshot["current_exec_start_ts"] = exec_start_ts
         trace_snapshot["current_exec_finish_ts"] = exec_end_ts
         trace_snapshot["current_exec_duration_ms"] = exec_duration_ms
+        if transmission_phase in {"decode", "mixed"} and decode_tokens > 0:
+            trace_snapshot["decode_window_start_ts"] = exec_start_ts
+            trace_snapshot["decode_window_finish_ts"] = exec_end_ts
+            trace_snapshot["decode_window_duration_ms"] = exec_duration_ms
         logger.info(
             "[MoLink][VE%s][TRACE] phase=%s exec_ms=%.3f total_tokens=%d decode_tokens=%d trace_seq=%d",
             virtual_engine,

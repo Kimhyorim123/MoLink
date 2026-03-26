@@ -32,6 +32,27 @@ def _now_monotonic() -> float:
     return time.monotonic()
 
 
+def _serialize_prefill_envelope(
+    intermediate_tensors_cpu: Dict[str, torch.Tensor],
+    scheduler_output_bytes: bytes,
+    grpc_metadata: Dict[str, Any],
+    virtual_engine: int,
+) -> bytes:
+    tensor_bytes = {}
+    for key, tensor in intermediate_tensors_cpu.items():
+        buffer = io.BytesIO()
+        torch.save(tensor, buffer)
+        tensor_bytes[key] = buffer.getvalue()
+
+    envelope = {
+        "scheduler_output": scheduler_output_bytes,
+        "intermediate_tensors": tensor_bytes,
+        "grpc_metadata": grpc_metadata,
+        "virtual_engine": virtual_engine,
+    }
+    return cloudpickle.dumps(envelope)
+
+
 @dataclass
 class DeliveryItem:
     push_type: str
@@ -173,12 +194,12 @@ class TensorDeliveryProcess(mp.Process):
 
         def _estimate_available_time_ms(item: DeliveryItem, tc: float) -> tuple[float, str, Dict[str, Any]]:
             trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
-            ts = trace.get("current_exec_start_ts")
-            tf = trace.get("current_exec_finish_ts")
+            ts = trace.get("decode_window_start_ts") or trace.get("last_decode_start_ts")
+            tf = trace.get("decode_window_finish_ts") or trace.get("last_decode_finish_ts")
             last_decode_finish_ts = trace.get("last_decode_finish_ts")
             decode_duration_ms = trace.get("last_decode_duration_ms")
             if decode_duration_ms is None:
-                decode_duration_ms = trace.get("current_exec_duration_ms")
+                decode_duration_ms = trace.get("decode_window_duration_ms")
             if decode_duration_ms is None:
                 decode_duration_ms = runtime_stats.get("decode_send_ms_ema")
             if decode_duration_ms is None:
@@ -230,7 +251,10 @@ class TensorDeliveryProcess(mp.Process):
             tp = last_decode_finish_ts
             if tp is None:
                 tp = tf if tf is not None else tc
-            predicted_tf = tp + (to_ms + tm_ms) / 1000.0
+            decode_gap_ms = runtime_stats.get("decode_arrival_gap_ms_ema") or 0.0
+            predicted_ts = tp + decode_gap_ms / 1000.0
+            predicted_tf = predicted_ts + (to_ms + tm_ms) / 1000.0
+            info["predicted_ts"] = predicted_ts
             ta_ms = max((predicted_tf - tc) * 1000.0, 0.1)
             info["predicted_tf"] = predicted_tf
             info["Ta_ms"] = ta_ms
@@ -333,19 +357,12 @@ class TensorDeliveryProcess(mp.Process):
             assert item.scheduler_output_bytes is not None
             assert item.grpc_metadata is not None
 
-            tensor_bytes = {}
-            for key, tensor in item.intermediate_tensors_cpu.items():
-                buffer = io.BytesIO()
-                torch.save(tensor, buffer)
-                tensor_bytes[key] = buffer.getvalue()
-
-            envelope = {
-                "scheduler_output": item.scheduler_output_bytes,
-                "intermediate_tensors": tensor_bytes,
-                "grpc_metadata": item.grpc_metadata,
-                "virtual_engine": item.virtual_engine,
-            }
-            payload = cloudpickle.dumps(envelope)
+            payload = _serialize_prefill_envelope(
+                item.intermediate_tensors_cpu,
+                item.scheduler_output_bytes,
+                item.grpc_metadata,
+                item.virtual_engine,
+            )
             item.transfer_id = uuid.uuid4().hex
             item.serialized_payload = payload
             item.total_bytes = len(payload)
@@ -426,7 +443,7 @@ class TensorDeliveryProcess(mp.Process):
                 )
                 logger.info(
                     "[MoLink][VE%s][DELIVERY][JIT] ta_case=%s reason=%s tc=%.6f ts=%s tf=%s predicted_tf=%s "
-                    "trace_seq=%s current_exec_start_ts=%s current_exec_finish_ts=%s last_decode_finish_ts=%s "
+                    "predicted_ts=%s trace_seq=%s current_exec_start_ts=%s current_exec_finish_ts=%s last_decode_finish_ts=%s "
                     "decode_q=%s prefill_q=%s head_q=%s decode_tokens=%s bw_bytes_per_ms=%.3f",
                     item.virtual_engine,
                     ta_case,
@@ -435,6 +452,7 @@ class TensorDeliveryProcess(mp.Process):
                     ta_info.get("ts"),
                     ta_info.get("tf"),
                     ta_info.get("predicted_tf"),
+                    ta_info.get("predicted_ts"),
                     ta_info.get("trace_seq"),
                     ta_info.get("current_exec_start_ts"),
                     ta_info.get("current_exec_finish_ts"),
@@ -842,12 +860,33 @@ class TensorDeliveryManager:
         tensors_cpu = {k: v.to("cpu") for k, v in intermediate_tensors.items()}
         enqueue_ts = _now_monotonic()
         phase = grpc_metadata.get("transmission_phase", "unknown")
+        serialized_payload = None
+        transfer_id = None
+        total_bytes = 0
+        left_bytes = 0
+        is_chunked = False
+        pre_serialize_ms = 0.0
+        if phase == "prefill":
+            prepare_start_ts = _now_monotonic()
+            serialized_payload = _serialize_prefill_envelope(
+                tensors_cpu,
+                scheduler_output_bytes,
+                grpc_metadata,
+                virtual_engine,
+            )
+            pre_serialize_ms = (_now_monotonic() - prepare_start_ts) * 1000.0
+            transfer_id = uuid.uuid4().hex
+            total_bytes = len(serialized_payload)
+            left_bytes = total_bytes
+            is_chunked = True
         logger.info(
-            "[MoLink][VE%s][DELIVERY] enqueue phase=%s target=%s tensors=%d",
+            "[MoLink][VE%s][DELIVERY] enqueue phase=%s target=%s tensors=%d pre_serialized=%s pre_serialize_ms=%.3f",
             virtual_engine,
             phase,
             next_server,
             len(tensors_cpu),
+            phase == "prefill",
+            pre_serialize_ms,
         )
 
         item = DeliveryItem(
@@ -859,6 +898,11 @@ class TensorDeliveryManager:
             intermediate_tensors_cpu=tensors_cpu,
             scheduler_output_bytes=scheduler_output_bytes,
             grpc_metadata=grpc_metadata,
+            transfer_id=transfer_id,
+            serialized_payload=serialized_payload,
+            total_bytes=total_bytes,
+            left_bytes=left_bytes,
+            is_chunked=is_chunked,
         )
         self._process.delivery_queue.put_nowait(item)
 
