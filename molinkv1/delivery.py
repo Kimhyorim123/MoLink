@@ -271,6 +271,12 @@ class TensorDeliveryProcess(mp.Process):
         def _determine_chunk_size(item: DeliveryItem) -> tuple[int, str, Dict[str, Any]]:
             tc = _now_monotonic()
             ta_ms, ta_case, info = _estimate_available_time_ms(item, tc)
+            if info.get("case_reason") == "no_decode_window_available":
+                chunk_size = min(self.chunk_size_bytes, item.left_bytes or item.total_bytes)
+                info["fallback"] = "fixed_chunk_no_decode_window"
+                info["selected_chunk_size"] = chunk_size
+                return chunk_size, ta_case, info
+
             bandwidth_bytes_per_ms = info["bandwidth_bytes_per_ms"]
             dynamic_size = int(max(bandwidth_bytes_per_ms * ta_ms * 0.9, 1.0))
             chunk_size = min(item.left_bytes or item.total_bytes, dynamic_size)
