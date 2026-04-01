@@ -13,7 +13,7 @@ import time
 import traceback
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty
 from typing import Any, Deque, Dict, Optional, Set, Tuple
 
@@ -72,6 +72,12 @@ class DeliveryItem:
     is_chunked: bool = False
     scheduled_ts: Optional[float] = None
     launch_ts: Optional[float] = None
+    selection_reason: Optional[str] = None
+    observed_weight: Optional[int] = None
+    selected_decode_q_len: Optional[int] = None
+    selected_prefill_q_len: Optional[int] = None
+    selected_head_q_len: Optional[int] = None
+    item_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class TensorDeliveryProcess(mp.Process):
@@ -194,8 +200,16 @@ class TensorDeliveryProcess(mp.Process):
 
         def _estimate_available_time_ms(item: DeliveryItem, tc: float) -> tuple[float, str, Dict[str, Any]]:
             trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
-            ts = trace.get("decode_window_start_ts") or trace.get("last_decode_start_ts")
-            tf = trace.get("decode_window_finish_ts") or trace.get("last_decode_finish_ts")
+            decode_window_ts = trace.get("decode_window_start_ts")
+            decode_window_tf = trace.get("decode_window_finish_ts")
+            if decode_window_ts is not None or decode_window_tf is not None:
+                decode_window_source = "decode_window"
+            elif trace.get("last_decode_start_ts") is not None or trace.get("last_decode_finish_ts") is not None:
+                decode_window_source = "last_decode"
+            else:
+                decode_window_source = "none"
+            ts = decode_window_ts or trace.get("last_decode_start_ts")
+            tf = decode_window_tf or trace.get("last_decode_finish_ts")
             last_decode_finish_ts = trace.get("last_decode_finish_ts")
             decode_duration_ms = trace.get("last_decode_duration_ms")
             if decode_duration_ms is None:
@@ -233,6 +247,13 @@ class TensorDeliveryProcess(mp.Process):
                 "current_exec_finish_ts": trace.get("current_exec_finish_ts"),
                 "last_decode_finish_ts": last_decode_finish_ts,
                 "trace_seq": trace.get("trace_seq"),
+                "decode_window_source": decode_window_source,
+                "prefill_item_id": item.item_id,
+                "selection_reason": item.selection_reason,
+                "observed_weight": item.observed_weight,
+                "selected_decode_q_len": item.selected_decode_q_len,
+                "selected_prefill_q_len": item.selected_prefill_q_len,
+                "selected_head_q_len": item.selected_head_q_len,
             }
 
             epsilon_s = 0.002
@@ -258,6 +279,8 @@ class TensorDeliveryProcess(mp.Process):
             ta_ms = max((predicted_tf - tc) * 1000.0, 0.1)
             info["predicted_tf"] = predicted_tf
             info["Ta_ms"] = ta_ms
+            info["tc_minus_ts_ms"] = None if ts is None else (tc - ts) * 1000.0
+            info["tc_minus_tf_ms"] = None if tf is None else (tc - tf) * 1000.0
             if ts is None:
                 info["case_reason"] = "no_decode_window_available"
             elif tf is None:
@@ -321,10 +344,11 @@ class TensorDeliveryProcess(mp.Process):
                 send_end_ts = _now_monotonic()
                 _update_send_stats(item.phase, payload_bytes, (send_end_ts - send_start_ts) * 1000.0)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] phase=%s target=%s queue_wait_ms=%.3f "
+                    "[MoLink][VE%s][DELIVERY] item_id=%s phase=%s target=%s queue_wait_ms=%.3f "
                     "schedule_wait_ms=%.3f launch_wait_ms=%.3f send_ms=%.3f "
                     "payload_bytes=%d tensors=%d response=%s",
                     item.virtual_engine,
+                    item.item_id,
                     item.phase,
                     item.target_server,
                     (send_start_ts - item.enqueue_ts) * 1000.0,
@@ -377,8 +401,9 @@ class TensorDeliveryProcess(mp.Process):
             item.is_chunked = True
             trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
             logger.info(
-                "[MoLink][VE%s][DELIVERY] chunk_prepare phase=%s transfer_id=%s total_bytes=%d fallback_chunk_size=%d target=%s trace_seq=%s decode_tokens=%s",
+                "[MoLink][VE%s][DELIVERY] item_id=%s chunk_prepare phase=%s transfer_id=%s total_bytes=%d fallback_chunk_size=%d target=%s trace_seq=%s decode_tokens=%s",
                 item.virtual_engine,
+                item.item_id,
                 item.phase,
                 item.transfer_id,
                 item.total_bytes,
@@ -426,8 +451,9 @@ class TensorDeliveryProcess(mp.Process):
                 send_ms = (send_end_ts - send_start_ts) * 1000.0
                 _update_send_stats(item.phase, len(chunk_data), send_ms)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f schedule_wait_ms=%.3f launch_wait_ms=%.3f prepare_ms=%.3f send_ms=%.3f response=%s ta_case=%s fallback=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d",
+                    "[MoLink][VE%s][DELIVERY] item_id=%s chunk_send phase=%s transfer_id=%s target=%s offset=%d sent=%d left=%d queue_wait_ms=%.3f schedule_wait_ms=%.3f launch_wait_ms=%.3f prepare_ms=%.3f send_ms=%.3f response=%s ta_case=%s fallback=%s Ta_ms=%.3f Td_ms=%.3f Tm_ms=%.3f To_ms=%.3f chunk_size=%d selected_reason=%s W=%s selected_decode_q=%s selected_prefill_q=%s selected_head_q=%s",
                     item.virtual_engine,
+                    item.item_id,
                     item.phase,
                     item.transfer_id,
                     item.target_server,
@@ -447,12 +473,19 @@ class TensorDeliveryProcess(mp.Process):
                     float(ta_info.get("Tm_ms", 0.0)),
                     float(ta_info.get("To_ms", 0.0)),
                     chunk_size,
+                    ta_info.get("selection_reason"),
+                    ta_info.get("observed_weight"),
+                    ta_info.get("selected_decode_q_len"),
+                    ta_info.get("selected_prefill_q_len"),
+                    ta_info.get("selected_head_q_len"),
                 )
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY][JIT] ta_case=%s reason=%s fallback=%s tc=%.6f ts=%s tf=%s predicted_tf=%s "
-                    "predicted_ts=%s trace_seq=%s current_exec_start_ts=%s current_exec_finish_ts=%s last_decode_finish_ts=%s "
-                    "decode_q=%s prefill_q=%s head_q=%s decode_tokens=%s bw_bytes_per_ms=%.3f",
+                    "[MoLink][VE%s][DELIVERY][JIT] item_id=%s ta_case=%s reason=%s fallback=%s tc=%.6f ts=%s tf=%s predicted_tf=%s "
+                    "predicted_ts=%s trace_seq=%s decode_window_source=%s current_exec_start_ts=%s current_exec_finish_ts=%s last_decode_finish_ts=%s "
+                    "decode_q=%s prefill_q=%s head_q=%s decode_tokens=%s bw_bytes_per_ms=%.3f tc_minus_ts_ms=%s tc_minus_tf_ms=%s "
+                    "selected_reason=%s W=%s selected_decode_q=%s selected_prefill_q=%s selected_head_q=%s",
                     item.virtual_engine,
+                    item.item_id,
                     ta_case,
                     ta_info.get("case_reason"),
                     ta_info.get("fallback"),
@@ -462,6 +495,7 @@ class TensorDeliveryProcess(mp.Process):
                     ta_info.get("predicted_tf"),
                     ta_info.get("predicted_ts"),
                     ta_info.get("trace_seq"),
+                    ta_info.get("decode_window_source"),
                     ta_info.get("current_exec_start_ts"),
                     ta_info.get("current_exec_finish_ts"),
                     ta_info.get("last_decode_finish_ts"),
@@ -470,13 +504,21 @@ class TensorDeliveryProcess(mp.Process):
                     ta_info.get("head_q_len"),
                     ta_info.get("decode_tokens"),
                     float(ta_info.get("bandwidth_bytes_per_ms", 0.0)),
+                    ta_info.get("tc_minus_ts_ms"),
+                    ta_info.get("tc_minus_tf_ms"),
+                    ta_info.get("selection_reason"),
+                    ta_info.get("observed_weight"),
+                    ta_info.get("selected_decode_q_len"),
+                    ta_info.get("selected_prefill_q_len"),
+                    ta_info.get("selected_head_q_len"),
                 )
                 if item.left_bytes > 0:
                     item.enqueue_ts = _now_monotonic()
                     prefill_queue.append(item)
                     logger.info(
-                        "[MoLink][VE%s][DELIVERY] chunk_requeue phase=%s transfer_id=%s left=%d prefill_q=%d",
+                        "[MoLink][VE%s][DELIVERY] item_id=%s chunk_requeue phase=%s transfer_id=%s left=%d prefill_q=%d",
                         item.virtual_engine,
+                        item.item_id,
                         item.phase,
                         item.transfer_id,
                         item.left_bytes,
@@ -484,8 +526,9 @@ class TensorDeliveryProcess(mp.Process):
                     )
                 else:
                     logger.info(
-                        "[MoLink][VE%s][DELIVERY] chunk_done phase=%s transfer_id=%s total_bytes=%d",
+                        "[MoLink][VE%s][DELIVERY] item_id=%s chunk_done phase=%s transfer_id=%s total_bytes=%d",
                         item.virtual_engine,
+                        item.item_id,
                         item.phase,
                         item.transfer_id,
                         item.total_bytes,
@@ -500,8 +543,9 @@ class TensorDeliveryProcess(mp.Process):
             if item.push_type == "head":
                 head_queue.append(item)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] classify push=head target=%s head_q=%d",
+                    "[MoLink][VE%s][DELIVERY] item_id=%s classify push=head target=%s head_q=%d",
                     item.virtual_engine,
+                    item.item_id,
                     item.target_server,
                     len(head_queue),
                 )
@@ -519,8 +563,9 @@ class TensorDeliveryProcess(mp.Process):
 
             trace = (item.grpc_metadata or {}).get("jit_runtime_trace", {})
             logger.info(
-                "[MoLink][VE%s][DELIVERY] classify phase=%s route=%s target=%s decode_q=%d prefill_q=%d selected_q_len=%d trace_seq=%s last_decode_finish_ts=%s",
+                "[MoLink][VE%s][DELIVERY] item_id=%s classify phase=%s route=%s target=%s decode_q=%d prefill_q=%d selected_q_len=%d trace_seq=%s last_decode_finish_ts=%s",
                 item.virtual_engine,
+                item.item_id,
                 item.phase,
                 queue_name,
                 item.target_server,
@@ -592,6 +637,9 @@ class TensorDeliveryProcess(mp.Process):
         def task_class(task: asyncio.Task) -> str:
             return getattr(task, "_molink_class", "unknown")
 
+        def task_item_id(task: asyncio.Task) -> str:
+            return getattr(task, "_molink_item_id", "unknown")
+
         def inflight_total() -> int:
             return len(head_tasks) + len(decode_tasks) + len(prefill_tasks)
 
@@ -616,10 +664,12 @@ class TensorDeliveryProcess(mp.Process):
             task._molink_virtual_engine = item.virtual_engine
             task._molink_target = item.target_server
             task._molink_class = traffic_class
+            task._molink_item_id = item.item_id
             task_set.add(task)
             logger.info(
-                "[MoLink][VE%s][DELIVERY] launch reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d",
+                "[MoLink][VE%s][DELIVERY] item_id=%s launch reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d",
                 item.virtual_engine,
+                item.item_id,
                 reason,
                 item.phase,
                 item.target_server,
@@ -649,8 +699,9 @@ class TensorDeliveryProcess(mp.Process):
                 try:
                     task.result()
                     logger.info(
-                        "[MoLink][VE%s][DELIVERY] complete reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d",
+                        "[MoLink][VE%s][DELIVERY] item_id=%s complete reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d",
                         task_virtual_engine(task),
+                        task_item_id(task),
                         task_reason(task),
                         task_phase(task),
                         task_target(task),
@@ -661,8 +712,9 @@ class TensorDeliveryProcess(mp.Process):
                     )
                 except Exception as e:
                     logger.error(
-                        "[MoLink][VE%s][DELIVERY] task_failed reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d error=%s",
+                        "[MoLink][VE%s][DELIVERY] item_id=%s task_failed reason=%s phase=%s target=%s inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d error=%s",
                         task_virtual_engine(task),
+                        task_item_id(task),
                         task_reason(task),
                         task_phase(task),
                         task_target(task),
@@ -686,9 +738,15 @@ class TensorDeliveryProcess(mp.Process):
             def schedule_log(item: DeliveryItem, reason: str, observed_weight: int) -> None:
                 now = _now_monotonic()
                 item.scheduled_ts = now
+                item.selection_reason = reason
+                item.observed_weight = observed_weight
+                item.selected_decode_q_len = len(decode_queue)
+                item.selected_prefill_q_len = len(prefill_queue)
+                item.selected_head_q_len = len(head_queue)
                 logger.info(
-                    "[MoLink][VE%s][DELIVERY] schedule reason=%s phase=%s target=%s W=%d inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d enqueue_to_schedule_ms=%.3f",
+                    "[MoLink][VE%s][DELIVERY] item_id=%s schedule reason=%s phase=%s target=%s W=%d inflight_total=%d decode_inflight=%d prefill_inflight=%d head_inflight=%d decode_q=%d prefill_q=%d head_q=%d enqueue_to_schedule_ms=%.3f",
                     item.virtual_engine,
+                    item.item_id,
                     reason,
                     item.phase,
                     item.target_server,

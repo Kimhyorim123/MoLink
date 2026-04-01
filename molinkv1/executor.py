@@ -79,6 +79,22 @@ def _extract_decode_token_count(scheduler_output: "SchedulerOutput") -> int:
     )
 
 
+def _extract_request_stats(scheduler_output: "SchedulerOutput") -> Dict[str, Any]:
+    new_req_ids = []
+    for req in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
+        req_id = getattr(req, "req_id", None)
+        if req_id is not None:
+            new_req_ids.append(req_id)
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    cached_req_ids = list(getattr(cached_reqs, "req_ids", []) or [])
+    return {
+        "scheduled_new_req_count": len(new_req_ids),
+        "scheduled_cached_req_count": len(cached_req_ids),
+        "scheduled_new_req_ids": new_req_ids[:8],
+        "scheduled_cached_req_ids": cached_req_ids[:8],
+    }
+
+
 class MolinkExecutor(MultiprocExecutor):
     """Executor for cross-node pipeline parallelism using gRPC.
 
@@ -353,6 +369,7 @@ class MolinkExecutor(MultiprocExecutor):
         transmission_phase: str,
     ) -> Dict[str, Any]:
         state = self._jit_trace_by_ve.get(virtual_engine, {})
+        request_stats = _extract_request_stats(scheduler_output)
         return {
             "trace_seq": state.get("trace_seq", 0),
             "transmission_phase": transmission_phase,
@@ -371,6 +388,7 @@ class MolinkExecutor(MultiprocExecutor):
             "decode_window_start_ts": state.get("last_decode_start_ts"),
             "decode_window_finish_ts": state.get("last_decode_finish_ts"),
             "decode_window_duration_ms": state.get("last_decode_duration_ms"),
+            **request_stats,
         }
 
     def _record_exec_trace(
@@ -412,13 +430,17 @@ class MolinkExecutor(MultiprocExecutor):
             trace_snapshot["decode_window_finish_ts"] = exec_end_ts
             trace_snapshot["decode_window_duration_ms"] = exec_duration_ms
         logger.info(
-            "[MoLink][VE%s][TRACE] phase=%s exec_ms=%.3f total_tokens=%d decode_tokens=%d trace_seq=%d",
+            "[MoLink][VE%s][TRACE] phase=%s exec_ms=%.3f total_tokens=%d decode_tokens=%d trace_seq=%d new_req_count=%d cached_req_count=%d new_req_ids=%s cached_req_ids=%s",
             virtual_engine,
             transmission_phase,
             exec_duration_ms,
             getattr(scheduler_output, "total_num_scheduled_tokens", 0),
             decode_tokens,
             trace_snapshot["trace_seq"],
+            trace_snapshot["scheduled_new_req_count"],
+            trace_snapshot["scheduled_cached_req_count"],
+            trace_snapshot["scheduled_new_req_ids"],
+            trace_snapshot["scheduled_cached_req_ids"],
         )
         return trace_snapshot
 
